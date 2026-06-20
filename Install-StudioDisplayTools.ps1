@@ -57,4 +57,4 @@ if (-not $SkipBrightnessKeyBridge) {
 }
 
 Write-Host ""
-Write-Host "Studio Display Tools installation finished."
+Write-Host "StudioDIsplayWithWindows installation finished."

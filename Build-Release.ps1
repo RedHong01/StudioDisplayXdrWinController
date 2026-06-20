@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version = "0.1.0",
-    [string]$ProjectName = "studio-display-tools-windows"
+    [string]$ProjectName = "StudioDIsplayWithWindows"
 )
 
 $ErrorActionPreference = "Stop"

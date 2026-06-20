@@ -1,4 +1,4 @@
-# Studio Display Tools for Windows
+# StudioDIsplayWithWindows
 
 Open-source PowerShell utilities for using Apple Studio Display on Windows PCs.
 
@@ -39,7 +39,7 @@ This project packages the setup work in this folder into a reusable toolset:
 
 If you downloaded a release ZIP from GitHub:
 
-1. Extract it to a normal folder such as `C:\Tools\studio-display-tools-windows`.
+1. Extract it to a normal folder such as `C:\Tools\StudioDIsplayWithWindows`.
 2. Open PowerShell in that folder.
 3. Run:
 
@@ -141,8 +141,8 @@ To create a distributable ZIP that is safe to upload to GitHub Releases:
 powershell -ExecutionPolicy Bypass -File .\Build-Release.ps1 -Version 0.1.0
 ```
 
-The script writes a clean bundle to `dist\studio-display-tools-windows-v0.1.0`
-and also creates `dist\studio-display-tools-windows-v0.1.0.zip`.
+The script writes a clean bundle to `dist\StudioDIsplayWithWindows-v0.1.0`
+and also creates `dist\StudioDIsplayWithWindows-v0.1.0.zip`.
 
 Runtime artifacts such as logs, backups, and build output are intentionally
 excluded from version control and the release bundle.
