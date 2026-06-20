@@ -1,0 +1,18 @@
+# Runtime artifacts
+*.log
+*.pid
+*.zip
+
+# Generated output
+dist/
+
+# Local runtime state
+backups/*
+!backups/.gitkeep
+
+# Editor files
+.vscode/
+
+# PowerShell noise
+*.tmp
+*.bak

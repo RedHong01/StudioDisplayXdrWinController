@@ -1,0 +1,402 @@
+[CmdletBinding()]
+param(
+    [switch]$EnableLogging,
+    [switch]$VerboseConsumerLog,
+    [switch]$SelfTestUp,
+    [switch]$SelfTestDown,
+    [ValidateRange(1,100)]
+    [int]$StepPercent = 10
+)
+
+$ErrorActionPreference = "Stop"
+
+$bridgeRoot = $PSScriptRoot
+$pidFile = Join-Path $bridgeRoot "BrightnessKeyBridge.pid"
+$logPath = Join-Path $bridgeRoot "BrightnessKeyBridge.log"
+$mutexName = "StudioDisplayBrightnessKeyBridge"
+$coordinationRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools\Shared"
+$suppressionFile = Join-Path $coordinationRoot "BrightnessKeySuppression.txt"
+$hidHelperPath = Join-Path $bridgeRoot "StudioDisplayHid.ps1"
+
+Add-Type -AssemblyName System.Windows.Forms
+. $hidHelperPath
+
+function Write-BridgeLog {
+    param([string]$Message)
+
+    if (-not $EnableLogging) {
+        return
+    }
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    Add-Content -LiteralPath $logPath -Value "$timestamp $Message"
+}
+
+function Get-ClampedPercent {
+    param([int]$Value)
+
+    if ($Value -lt 0) { return 0 }
+    if ($Value -gt 100) { return 100 }
+    return $Value
+}
+
+function Apply-BrightnessStep {
+    param([bool]$Increase)
+
+    $current = Get-StudioDisplayBrightnessPercent
+    $target = if ($Increase) {
+        Get-ClampedPercent ($current + $StepPercent)
+    } else {
+        Get-ClampedPercent ($current - $StepPercent)
+    }
+
+    if (-not (Test-Path $coordinationRoot)) {
+        New-Item -ItemType Directory -Force -Path $coordinationRoot | Out-Null
+    }
+
+    $direction = if ($Increase) { "up" } else { "down" }
+    $stamp = [DateTime]::UtcNow.ToString("o")
+    Set-Content -LiteralPath $suppressionFile -Value "$stamp|$direction" -Encoding ascii
+    Set-StudioDisplayBrightnessPercent -Percent $target
+    Write-BridgeLog ("Applied fixed brightness step {0}%: {1}% -> {2}%." -f $StepPercent, $current, $target)
+}
+
+$typeDefinition = @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
+{
+    private const int WM_INPUT = 0x00FF;
+    private const uint RID_INPUT = 0x10000003;
+    private const uint RIDI_PREPARSEDDATA = 0x20000005;
+    private const uint RIM_TYPEHID = 2;
+    private const uint RIDEV_INPUTSINK = 0x00000100;
+
+    private const ushort USAGE_PAGE_CONSUMER = 0x0C;
+    private const ushort USAGE_CONSUMER_CONTROL = 0x01;
+    private const ushort USAGE_BRIGHTNESS_INCREMENT = 0x006F;
+    private const ushort USAGE_BRIGHTNESS_DECREMENT = 0x0070;
+
+    private readonly Dictionary<IntPtr, IntPtr> preparsedDataCache = new Dictionary<IntPtr, IntPtr>();
+    private readonly Action<bool> onBrightnessUsage;
+    private readonly string logPath;
+    private readonly bool loggingEnabled;
+    private readonly bool verboseConsumerLog;
+
+    private DateTime lastIncrease = DateTime.MinValue;
+    private DateTime lastDecrease = DateTime.MinValue;
+
+    public BrightnessKeyBridge(Action<bool> onBrightnessUsage, string logPath, bool loggingEnabled, bool verboseConsumerLog)
+    {
+        this.onBrightnessUsage = onBrightnessUsage;
+        this.logPath = logPath;
+        this.loggingEnabled = loggingEnabled;
+        this.verboseConsumerLog = verboseConsumerLog;
+
+        CreateHandle(new CreateParams());
+        RegisterRawInput();
+        Log("Brightness key bridge started.");
+    }
+
+    public void Dispose()
+    {
+        foreach (IntPtr pointer in preparsedDataCache.Values)
+        {
+            if (pointer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+
+        preparsedDataCache.Clear();
+
+        if (Handle != IntPtr.Zero)
+        {
+            DestroyHandle();
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_INPUT)
+        {
+            try
+            {
+                ProcessRawInput(m.LParam);
+            }
+            catch (Exception ex)
+            {
+                Log("Raw input processing error: " + ex.Message);
+            }
+        }
+
+        base.WndProc(ref m);
+    }
+
+    private void RegisterRawInput()
+    {
+        RAWINPUTDEVICE[] devices = new RAWINPUTDEVICE[]
+        {
+            new RAWINPUTDEVICE
+            {
+                usUsagePage = USAGE_PAGE_CONSUMER,
+                usUsage = USAGE_CONSUMER_CONTROL,
+                dwFlags = RIDEV_INPUTSINK,
+                hwndTarget = Handle
+            }
+        };
+
+        if (!RegisterRawInputDevices(devices, (uint)devices.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
+        {
+            throw new InvalidOperationException("RegisterRawInputDevices failed.");
+        }
+    }
+
+    private void ProcessRawInput(IntPtr rawInputHandle)
+    {
+        uint size = 0;
+        uint headerSize = (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER));
+        uint result = GetRawInputData(rawInputHandle, RID_INPUT, IntPtr.Zero, ref size, headerSize);
+        if (result == 0xFFFFFFFF || size == 0)
+        {
+            return;
+        }
+
+        IntPtr buffer = Marshal.AllocHGlobal((int)size);
+        try
+        {
+            result = GetRawInputData(rawInputHandle, RID_INPUT, buffer, ref size, headerSize);
+            if (result == 0xFFFFFFFF)
+            {
+                return;
+            }
+
+            RAWINPUTHEADER header = (RAWINPUTHEADER)Marshal.PtrToStructure(buffer, typeof(RAWINPUTHEADER));
+            if (header.dwType != RIM_TYPEHID)
+            {
+                return;
+            }
+
+            IntPtr hidHeader = IntPtr.Add(buffer, Marshal.SizeOf(typeof(RAWINPUTHEADER)));
+            int sizeHid = Marshal.ReadInt32(hidHeader, 0);
+            int count = Marshal.ReadInt32(hidHeader, 4);
+            IntPtr rawData = IntPtr.Add(hidHeader, 8);
+            IntPtr preparsedData = GetPreparsedData(header.hDevice);
+
+            if (preparsedData == IntPtr.Zero || sizeHid <= 0 || count <= 0)
+            {
+                return;
+            }
+
+            for (int index = 0; index < count; index++)
+            {
+                IntPtr report = IntPtr.Add(rawData, index * sizeHid);
+                ushort[] usages = new ushort[16];
+                uint usageLength = (uint)usages.Length;
+
+                int status = HidP_GetUsages(
+                    HIDP_REPORT_TYPE.HidP_Input,
+                    USAGE_PAGE_CONSUMER,
+                    0,
+                    usages,
+                    ref usageLength,
+                    preparsedData,
+                    report,
+                    (uint)sizeHid);
+
+                if (status < 0 || usageLength == 0)
+                {
+                    continue;
+                }
+
+                for (int usageIndex = 0; usageIndex < usageLength; usageIndex++)
+                {
+                    HandleConsumerUsage(usages[usageIndex]);
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private IntPtr GetPreparsedData(IntPtr deviceHandle)
+    {
+        if (deviceHandle == IntPtr.Zero)
+        {
+            return IntPtr.Zero;
+        }
+
+        IntPtr cached;
+        if (preparsedDataCache.TryGetValue(deviceHandle, out cached))
+        {
+            return cached;
+        }
+
+        uint size = 0;
+        uint result = GetRawInputDeviceInfo(deviceHandle, RIDI_PREPARSEDDATA, IntPtr.Zero, ref size);
+        if (result == 0xFFFFFFFF || size == 0)
+        {
+            return IntPtr.Zero;
+        }
+
+        IntPtr buffer = Marshal.AllocHGlobal((int)size);
+        result = GetRawInputDeviceInfo(deviceHandle, RIDI_PREPARSEDDATA, buffer, ref size);
+        if (result == 0xFFFFFFFF)
+        {
+            Marshal.FreeHGlobal(buffer);
+            return IntPtr.Zero;
+        }
+
+        preparsedDataCache[deviceHandle] = buffer;
+        return buffer;
+    }
+
+    private void HandleConsumerUsage(ushort usage)
+    {
+        if (verboseConsumerLog)
+        {
+            Log("Consumer usage 0x" + usage.ToString("X4"));
+        }
+
+        if (usage == USAGE_BRIGHTNESS_INCREMENT)
+        {
+            if ((DateTime.UtcNow - lastIncrease).TotalMilliseconds >= 75)
+            {
+                lastIncrease = DateTime.UtcNow;
+                onBrightnessUsage(true);
+                Log("Brightness increment recognized.");
+            }
+            return;
+        }
+
+        if (usage == USAGE_BRIGHTNESS_DECREMENT)
+        {
+            if ((DateTime.UtcNow - lastDecrease).TotalMilliseconds >= 75)
+            {
+                lastDecrease = DateTime.UtcNow;
+                onBrightnessUsage(false);
+                Log("Brightness decrement recognized.");
+            }
+        }
+    }
+
+    private void Log(string message)
+    {
+        if (!loggingEnabled)
+        {
+            return;
+        }
+
+        string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + message + Environment.NewLine;
+        File.AppendAllText(logPath, line);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage;
+        public ushort usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTHEADER
+    {
+        public uint dwType;
+        public uint dwSize;
+        public IntPtr hDevice;
+        public IntPtr wParam;
+    }
+
+    private enum HIDP_REPORT_TYPE
+    {
+        HidP_Input = 0,
+        HidP_Output = 1,
+        HidP_Feature = 2
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterRawInputDevices(
+        [In] RAWINPUTDEVICE[] pRawInputDevices,
+        uint uiNumDevices,
+        uint cbSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(
+        IntPtr hRawInput,
+        uint uiCommand,
+        IntPtr pData,
+        ref uint pcbSize,
+        uint cbSizeHeader);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputDeviceInfo(
+        IntPtr hDevice,
+        uint uiCommand,
+        IntPtr pData,
+        ref uint pcbSize);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    private static extern int HidP_GetUsages(
+        HIDP_REPORT_TYPE ReportType,
+        ushort UsagePage,
+        ushort LinkCollection,
+        [Out] ushort[] UsageList,
+        ref uint UsageLength,
+        IntPtr PreparsedData,
+        IntPtr Report,
+        uint ReportLength);
+}
+"@
+
+Add-Type -TypeDefinition $typeDefinition -ReferencedAssemblies @("System.Windows.Forms.dll")
+
+if ($SelfTestUp -or $SelfTestDown) {
+    Apply-BrightnessStep -Increase:$SelfTestUp
+    exit 0
+}
+
+$createdNew = $false
+$mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
+if (-not $createdNew) {
+    exit 0
+}
+
+Set-Content -LiteralPath $pidFile -Value $PID -Encoding ascii
+
+try {
+    $callback = [System.Action[bool]]{
+        param($increase)
+        try {
+            Apply-BrightnessStep -Increase:$increase
+        }
+        catch {
+            Write-BridgeLog ("Brightness step error: " + $_.Exception.Message)
+        }
+    }
+
+    $bridge = New-Object BrightnessKeyBridge($callback, $logPath, $EnableLogging.IsPresent, $VerboseConsumerLog.IsPresent)
+    try {
+        [System.Windows.Forms.Application]::Run()
+    }
+    finally {
+        $bridge.Dispose()
+    }
+}
+finally {
+    if (Test-Path $pidFile) {
+        Remove-Item -LiteralPath $pidFile -Force
+    }
+
+    if ($mutex) {
+        $mutex.ReleaseMutex() | Out-Null
+        $mutex.Dispose()
+    }
+}
