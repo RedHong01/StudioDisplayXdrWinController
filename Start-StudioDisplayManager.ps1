@@ -7,6 +7,7 @@ $installRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools\StudioDisplayMana
 $managerTarget = Join-Path $installRoot "StudioDisplayManager.ps1"
 $managerPidFile = Join-Path $installRoot "StudioDisplayManager.pid"
 $powershellExe = Join-Path $PSHOME "powershell.exe"
+$appName = "Studio Display XDR Win Controller"
 
 function Test-ManagerRunning {
     if (-not (Test-Path $managerPidFile)) {
@@ -29,11 +30,11 @@ function Test-ManagerRunning {
 }
 
 if (-not (Test-Path $managerTarget)) {
-    throw "Studio Display Manager is not installed. Run Install-StudioDisplayManager.ps1 first."
+    throw "$appName is not installed. Run Install-StudioDisplayManager.ps1 first."
 }
 
 if (Test-ManagerRunning) {
-    Write-Host "Studio Display Manager is already running."
+    Write-Host "$appName is already running."
     exit 0
 }
 
@@ -48,7 +49,7 @@ Start-Process -FilePath $powershellExe -WorkingDirectory $installRoot -WindowSty
 Start-Sleep -Seconds 5
 
 if (Test-ManagerRunning) {
-    Write-Host "Studio Display Manager started."
+    Write-Host "$appName started."
 } else {
-    throw "Studio Display Manager did not start successfully."
+    throw "$appName did not start successfully."
 }

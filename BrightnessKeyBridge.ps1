@@ -2,6 +2,7 @@
 param(
     [switch]$EnableLogging,
     [switch]$VerboseConsumerLog,
+    [switch]$CaptureF1F2BrightnessKeys,
     [switch]$SelfTestUp,
     [switch]$SelfTestDown,
     [ValidateRange(1,100)]
@@ -73,29 +74,43 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
     private const int WM_INPUT = 0x00FF;
     private const uint RID_INPUT = 0x10000003;
     private const uint RIDI_PREPARSEDDATA = 0x20000005;
+    private const uint RIM_TYPEKEYBOARD = 1;
     private const uint RIM_TYPEHID = 2;
     private const uint RIDEV_INPUTSINK = 0x00000100;
+    private const ushort RI_KEY_BREAK = 0x0001;
 
+    private const ushort USAGE_PAGE_GENERIC_DESKTOP = 0x01;
+    private const ushort USAGE_KEYBOARD = 0x06;
     private const ushort USAGE_PAGE_CONSUMER = 0x0C;
     private const ushort USAGE_CONSUMER_CONTROL = 0x01;
     private const ushort USAGE_BRIGHTNESS_INCREMENT = 0x006F;
     private const ushort USAGE_BRIGHTNESS_DECREMENT = 0x0070;
+    private const ushort VK_F1 = 0x70;
+    private const ushort VK_F2 = 0x71;
+    private const ushort VK_F14 = 0x7D;
+    private const ushort VK_F15 = 0x7E;
 
     private readonly Dictionary<IntPtr, IntPtr> preparsedDataCache = new Dictionary<IntPtr, IntPtr>();
     private readonly Action<bool> onBrightnessUsage;
     private readonly string logPath;
     private readonly bool loggingEnabled;
     private readonly bool verboseConsumerLog;
+    private readonly bool captureF1F2BrightnessKeys;
 
-    private DateTime lastIncrease = DateTime.MinValue;
-    private DateTime lastDecrease = DateTime.MinValue;
+    private bool consumerIncreaseActive = false;
+    private bool consumerDecreaseActive = false;
+    private bool keyboardF1Active = false;
+    private bool keyboardF2Active = false;
+    private bool keyboardF14Active = false;
+    private bool keyboardF15Active = false;
 
-    public BrightnessKeyBridge(Action<bool> onBrightnessUsage, string logPath, bool loggingEnabled, bool verboseConsumerLog)
+    public BrightnessKeyBridge(Action<bool> onBrightnessUsage, string logPath, bool loggingEnabled, bool verboseConsumerLog, bool captureF1F2BrightnessKeys)
     {
         this.onBrightnessUsage = onBrightnessUsage;
         this.logPath = logPath;
         this.loggingEnabled = loggingEnabled;
         this.verboseConsumerLog = verboseConsumerLog;
+        this.captureF1F2BrightnessKeys = captureF1F2BrightnessKeys;
 
         CreateHandle(new CreateParams());
         RegisterRawInput();
@@ -147,6 +162,13 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
                 usUsage = USAGE_CONSUMER_CONTROL,
                 dwFlags = RIDEV_INPUTSINK,
                 hwndTarget = Handle
+            },
+            new RAWINPUTDEVICE
+            {
+                usUsagePage = USAGE_PAGE_GENERIC_DESKTOP,
+                usUsage = USAGE_KEYBOARD,
+                dwFlags = RIDEV_INPUTSINK,
+                hwndTarget = Handle
             }
         };
 
@@ -176,6 +198,14 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
             }
 
             RAWINPUTHEADER header = (RAWINPUTHEADER)Marshal.PtrToStructure(buffer, typeof(RAWINPUTHEADER));
+            if (header.dwType == RIM_TYPEKEYBOARD)
+            {
+                IntPtr keyboardPointer = IntPtr.Add(buffer, Marshal.SizeOf(typeof(RAWINPUTHEADER)));
+                RAWKEYBOARD keyboard = (RAWKEYBOARD)Marshal.PtrToStructure(keyboardPointer, typeof(RAWKEYBOARD));
+                HandleKeyboardUsage(keyboard);
+                return;
+            }
+
             if (header.dwType != RIM_TYPEHID)
             {
                 return;
@@ -208,14 +238,23 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
                     report,
                     (uint)sizeHid);
 
-                if (status < 0 || usageLength == 0)
+                if (status < 0)
                 {
                     continue;
                 }
 
+                bool sawBrightnessUsage = false;
                 for (int usageIndex = 0; usageIndex < usageLength; usageIndex++)
                 {
-                    HandleConsumerUsage(usages[usageIndex]);
+                    if (HandleConsumerUsage(usages[usageIndex]))
+                    {
+                        sawBrightnessUsage = true;
+                    }
+                }
+
+                if (!sawBrightnessUsage)
+                {
+                    ReleaseConsumerBrightnessKeys();
                 }
             }
         }
@@ -257,7 +296,7 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
         return buffer;
     }
 
-    private void HandleConsumerUsage(ushort usage)
+    private bool HandleConsumerUsage(ushort usage)
     {
         if (verboseConsumerLog)
         {
@@ -266,22 +305,114 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
 
         if (usage == USAGE_BRIGHTNESS_INCREMENT)
         {
-            if ((DateTime.UtcNow - lastIncrease).TotalMilliseconds >= 75)
+            consumerDecreaseActive = false;
+            if (!consumerIncreaseActive)
             {
-                lastIncrease = DateTime.UtcNow;
+                consumerIncreaseActive = true;
                 onBrightnessUsage(true);
-                Log("Brightness increment recognized.");
+                Log("Brightness increment recognized as one 10% press.");
             }
-            return;
+            return true;
         }
 
         if (usage == USAGE_BRIGHTNESS_DECREMENT)
         {
-            if ((DateTime.UtcNow - lastDecrease).TotalMilliseconds >= 75)
+            consumerIncreaseActive = false;
+            if (!consumerDecreaseActive)
             {
-                lastDecrease = DateTime.UtcNow;
+                consumerDecreaseActive = true;
                 onBrightnessUsage(false);
-                Log("Brightness decrement recognized.");
+                Log("Brightness decrement recognized as one 10% press.");
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    private void ReleaseConsumerBrightnessKeys()
+    {
+        consumerIncreaseActive = false;
+        consumerDecreaseActive = false;
+    }
+
+    private void HandleKeyboardUsage(RAWKEYBOARD keyboard)
+    {
+        bool isKeyUp = (keyboard.Flags & RI_KEY_BREAK) == RI_KEY_BREAK;
+        if (verboseConsumerLog)
+        {
+            Log("Keyboard raw input VKey=0x" + keyboard.VKey.ToString("X4") + " MakeCode=0x" + keyboard.MakeCode.ToString("X4") + " Flags=0x" + keyboard.Flags.ToString("X4") + " Message=0x" + keyboard.Message.ToString("X4"));
+        }
+
+        if (keyboard.VKey == VK_F14)
+        {
+            if (isKeyUp)
+            {
+                keyboardF14Active = false;
+                return;
+            }
+
+            if (!keyboardF14Active)
+            {
+                keyboardF14Active = true;
+                onBrightnessUsage(false);
+                Log("Brightness decrement recognized from keyboard F14 as one 10% press.");
+            }
+            return;
+        }
+
+        if (keyboard.VKey == VK_F15)
+        {
+            if (isKeyUp)
+            {
+                keyboardF15Active = false;
+                return;
+            }
+
+            if (!keyboardF15Active)
+            {
+                keyboardF15Active = true;
+                onBrightnessUsage(true);
+                Log("Brightness increment recognized from keyboard F15 as one 10% press.");
+            }
+            return;
+        }
+
+        if (!captureF1F2BrightnessKeys)
+        {
+            return;
+        }
+
+        if (keyboard.VKey == VK_F1)
+        {
+            if (isKeyUp)
+            {
+                keyboardF1Active = false;
+                return;
+            }
+
+            if (!keyboardF1Active)
+            {
+                keyboardF1Active = true;
+                onBrightnessUsage(false);
+                Log("Brightness decrement recognized from keyboard F1 as one 10% press.");
+            }
+            return;
+        }
+
+        if (keyboard.VKey == VK_F2)
+        {
+            if (isKeyUp)
+            {
+                keyboardF2Active = false;
+                return;
+            }
+
+            if (!keyboardF2Active)
+            {
+                keyboardF2Active = true;
+                onBrightnessUsage(true);
+                Log("Brightness increment recognized from keyboard F2 as one 10% press.");
             }
         }
     }
@@ -313,6 +444,17 @@ public sealed class BrightnessKeyBridge : NativeWindow, IDisposable
         public uint dwSize;
         public IntPtr hDevice;
         public IntPtr wParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWKEYBOARD
+    {
+        public ushort MakeCode;
+        public ushort Flags;
+        public ushort Reserved;
+        public ushort VKey;
+        public uint Message;
+        public uint ExtraInformation;
     }
 
     private enum HIDP_REPORT_TYPE
@@ -366,6 +508,7 @@ if ($SelfTestUp -or $SelfTestDown) {
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 if (-not $createdNew) {
+    Write-BridgeLog "Another brightness key bridge instance is already running; exiting this duplicate instance."
     exit 0
 }
 
@@ -382,7 +525,7 @@ try {
         }
     }
 
-    $bridge = New-Object BrightnessKeyBridge($callback, $logPath, $EnableLogging.IsPresent, $VerboseConsumerLog.IsPresent)
+    $bridge = New-Object BrightnessKeyBridge($callback, $logPath, $EnableLogging.IsPresent, $VerboseConsumerLog.IsPresent, $CaptureF1F2BrightnessKeys.IsPresent)
     try {
         [System.Windows.Forms.Application]::Run()
     }

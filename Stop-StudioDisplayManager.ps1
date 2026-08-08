@@ -5,9 +5,11 @@ $ErrorActionPreference = "Stop"
 
 $installRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools\StudioDisplayManager"
 $legacyInstallRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools\SystemBrightnessMirror"
+$appName = "Studio Display XDR Win Controller"
 $pidFiles = @(
     (Join-Path $installRoot "StudioDisplayManager.pid"),
     (Join-Path $installRoot "SystemBrightnessMirror.pid"),
+    (Join-Path $installRoot "BrightnessKeyBridge.pid"),
     (Join-Path $legacyInstallRoot "SystemBrightnessMirrorTray.pid"),
     (Join-Path $legacyInstallRoot "StudioDisplayManager.pid"),
     (Join-Path $legacyInstallRoot "SystemBrightnessMirror.pid")
@@ -38,7 +40,7 @@ foreach ($pidFile in $pidFiles) {
 }
 
 if ($stoppedAny) {
-    Write-Host "Studio Display Manager stopped."
+    Write-Host "$appName stopped."
 } else {
-    Write-Host "Studio Display Manager is not running."
+    Write-Host "$appName is not running."
 }

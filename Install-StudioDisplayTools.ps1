@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipBrightnessUtility,
     [switch]$SkipManager,
+    [switch]$SkipBrightnessUtility,
     [switch]$SkipBrightnessKeyBridge,
     [switch]$SkipAutoStart,
     [switch]$SkipStartNow
@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $sourceRoot = $PSScriptRoot
+$appName = "Studio Display XDR Win Controller"
 
 function Get-SharedInstallArguments {
     $arguments = @()
@@ -39,22 +40,36 @@ function Invoke-LocalInstallScript {
 
     Write-Host ""
     Write-Host "==> Running $ScriptName"
-    & $scriptPath @ArgumentList
+    if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+        & $scriptPath @ArgumentList
+    }
+    else {
+        & $scriptPath
+    }
 }
 
-$sharedArguments = Get-SharedInstallArguments
+$sharedArguments = @(Get-SharedInstallArguments)
 
-if (-not $SkipBrightnessUtility) {
-    Invoke-LocalInstallScript -ScriptName "Install-StudioDisplayBrightness.ps1" -ArgumentList $sharedArguments
+if ($SkipBrightnessUtility) {
+    Write-Host ""
+    Write-Host "==> -SkipBrightnessUtility is kept for compatibility; the upstream studio-brightness auto-start utility is no longer installed by default."
+}
+else {
+    Write-Host ""
+    Write-Host "==> Skipping standalone studio-brightness. Direct HID brightness is managed inside Studio Display XDR Win Controller."
+}
+
+if ($SkipBrightnessKeyBridge) {
+    Write-Host ""
+    Write-Host "==> -SkipBrightnessKeyBridge is kept for compatibility; the brightness-key bridge now runs only as a controller worker."
 }
 
 if (-not $SkipManager) {
     Invoke-LocalInstallScript -ScriptName "Install-StudioDisplayManager.ps1" -ArgumentList $sharedArguments
 }
-
-if (-not $SkipBrightnessKeyBridge) {
-    Invoke-LocalInstallScript -ScriptName "Install-BrightnessKeyBridge.ps1" -ArgumentList $sharedArguments
+else {
+    Write-Warning "Skipped the integrated controller. No standalone brightness, HDR, or hot-plug automation will be installed."
 }
 
 Write-Host ""
-Write-Host "StudioDIsplayWithWindows installation finished."
+Write-Host "$appName installation finished."

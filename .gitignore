@@ -3,12 +3,35 @@
 *.pid
 *.zip
 
+# Local signing / certificate material (never publish)
+*.cer
+*.crt
+*.pfx
+*.p12
+*.pem
+*.key
+*.cat
+
 # Generated output
 dist/
+reports/
+drivers/
 
 # Local runtime state
 backups/*
 !backups/.gitkeep
+
+# Machine-local game or chat-app experiments
+local-tools/
+Apply-DiscordGamingStabilityFix.ps1
+DiscordGamingStabilityCheck.ps1
+Repair-TheAltersResolution.ps1
+Repair-ZenlessZoneZeroResolution.ps1
+Set-OverwatchAutoHDR.ps1
+Set-OverwatchExclusiveFullscreenProfile.ps1
+docs/Discord-StudioDisplay-Overwatch-Troubleshooting.md
+docs/The-Alters-Studio-Display-XDR.md
+docs/Zenless-Zone-Zero-Studio-Display-XDR.md
 
 # Editor files
 .vscode/

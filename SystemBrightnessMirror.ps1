@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [switch]$EnableLogging
+    [switch]$EnableLogging,
+    [ValidateRange(1,100)]
+    [int]$ExternalOnlyStartupFallbackPercent = 70,
+    [switch]$AllowStartupZeroSync
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,6 +61,7 @@ function Sync-StudioBrightness {
 
     try {
         Set-StudioBrightnessToPercent -Percent $Percent
+        Write-Log "Studio Display brightness synced to $Percent% during $Reason."
         return $true
     }
     catch {
@@ -105,11 +109,31 @@ Set-Content -LiteralPath $pidFile -Value $PID -Encoding ascii
 try {
     $initialPercent = Get-InternalBrightnessPercent
     $lastInternalPercent = $initialPercent
+    $startupSyncPercent = $initialPercent
     $lastRecoveryAttempt = [DateTime]::UtcNow
     $studioDisplayAvailable = $false
     Write-Log "Initial internal brightness is $initialPercent%."
 
-    if (Sync-StudioBrightness -Percent $initialPercent -Reason "initial startup sync") {
+    if ($initialPercent -eq 0 -and -not $AllowStartupZeroSync) {
+        $currentStudioPercent = $null
+        try {
+            $currentStudioPercent = Get-StudioDisplayBrightnessPercent
+        }
+        catch {
+            Write-Log "Could not read Studio Display brightness before startup zero guard: $($_.Exception.Message)"
+        }
+
+        if ($null -ne $currentStudioPercent -and $currentStudioPercent -gt 0) {
+            $startupSyncPercent = [int]$currentStudioPercent
+            Write-Log "Startup internal brightness is 0%, likely because the internal panel is off. Preserving current Studio Display brightness at $startupSyncPercent%."
+        }
+        else {
+            $startupSyncPercent = $ExternalOnlyStartupFallbackPercent
+            Write-Log "Startup internal brightness is 0% and Studio Display brightness is not readable/nonzero. Using safe external startup fallback $startupSyncPercent% instead of syncing 0%."
+        }
+    }
+
+    if (Sync-StudioBrightness -Percent $startupSyncPercent -Reason "initial startup sync") {
         $studioDisplayAvailable = $true
     } else {
         Write-Log "Studio Display is not ready yet. The mirror will keep retrying until the display reconnects."
