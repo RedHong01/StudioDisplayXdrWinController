@@ -253,6 +253,20 @@ function Test-StudioDisplayEvidencePresent {
     return [bool]$presentEvidence
 }
 
+function Test-ActiveMsFallbackMonitor {
+    try {
+        $activeMs = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop |
+            Where-Object { $_.Active -and $_.InstanceName -match '^DISPLAY\\MS_0001\\' } |
+            Select-Object -First 1
+
+        return [bool]$activeMs
+    }
+    catch {
+        Write-RefreshLog "Could not check whether DISPLAY\\MS_0001 is the active monitor identity: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Test-Studio5KModeEnumerated {
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen
     if (-not $screen) {
@@ -351,6 +365,11 @@ function Invoke-FallbackMonitorRestart {
 
     if (-not (Test-IsAdministrator)) {
         Write-RefreshLog "Skipping fallback monitor restart because this process is not elevated."
+        return
+    }
+
+    if (-not (Test-ActiveMsFallbackMonitor)) {
+        Write-RefreshLog "Skipping DISPLAY\\MS_0001 fallback monitor restart because MS_0001 is not the active monitor identity. Preserving the Apple/APPA identity avoids pushing a potentially HDR-capable path back onto the Boot Camp fallback during hot-plug recovery."
         return
     }
 

@@ -51,11 +51,13 @@ $integratedRepairLogProgressGraceSeconds = 120
 $integratedRepairWaitLogCooldownSeconds = 30
 $integratedRepairCooldownLogSeconds = 30
 $integratedRepairMissingTaskBackoffSeconds = 300
-$hdrGateBlockedBackoffSeconds = 600
-$hdrGateBlockedRetryLimit = 2
+$hdrGateBlockedBackoffSeconds = 90
+$hdrGateBlockedRetryLimit = 4
 $hdrGateBlockedLogCooldownSeconds = 60
 $resolutionModeTableBlockedBackoffSeconds = 600
 $resolutionModeTableBlockedRetryLimit = 1
+$resolutionModeTableStaleBackoffSeconds = 90
+$resolutionModeTableStaleRetryLimit = 3
 $resolutionModeTableBlockedLogCooldownSeconds = 60
 $autoRepairTaskRegistrationPromptBackoffSeconds = 1800
 $displayRepairBlockedProcessNames = @()
@@ -512,7 +514,27 @@ function Start-BrightnessKeyBridge {
     return $running
 }
 
+function Test-StudioDisplayDeepRepairActive {
+    if ($script:integratedRepairInFlight) {
+        return $true
+    }
+
+    try {
+        return [bool]((Get-StudioDisplayAutoRepairTaskState) -eq "Running")
+    }
+    catch {
+        return $false
+    }
+}
+
 function Start-BrightnessServices {
+    param([switch]$Force)
+
+    if (-not $Force -and (Test-StudioDisplayDeepRepairActive)) {
+        Write-AppLog "Brightness service start skipped because the integrated 5K/HDR repair task is still active. Brightness will be restored by the integrated pipeline after display/HDR gates finish."
+        return $false
+    }
+
     $mirrorStarted = Start-MirrorService
     $bridgeStarted = Start-BrightnessKeyBridge
     return [bool]($mirrorStarted -and $bridgeStarted)
@@ -600,9 +622,10 @@ function Save-StudioDisplayPipelineDecision {
     )
 
     try {
+        $now = Get-Date
         $decision = [ordered]@{
             Version = 1
-            UpdatedAt = (Get-Date).ToString("o")
+            UpdatedAt = $now.ToString("o")
             Reason = $Reason
             Stage = $Stage
             Action = $Action
@@ -624,7 +647,39 @@ function Save-StudioDisplayPipelineDecision {
                     WcgActive = [bool]$HdrState.WcgActive
                 }
             } else { $null }
-            KnownHdrGateConclusion = "If Boot Camp-style MS_0001 identity and 5K60 are ready but HDR remains blocked, the current known failure is VID_05AC&PID_1116 MI_08/MI_09 Apple USB control interfaces failing to start, which keeps HighDynamicRangeSupported=False."
+            KnownHdrGateConclusion = "If Boot Camp-style MS_0001 identity and 5K60 are ready but HDR remains blocked, record VID_05AC&PID_1116 MI_08/MI_09 Apple USB control-interface failures as correlation evidence. They are not a code=0 blocker when 5K60, HDR active, and brightness HID all validate."
+        }
+
+        if (Test-Path -LiteralPath $pipelineDecisionFile) {
+            try {
+                $previous = Get-Content -LiteralPath $pipelineDecisionFile -Raw -ErrorAction Stop | ConvertFrom-Json
+                $previousUpdatedAt = [DateTime]::MinValue
+                [void][DateTime]::TryParse([string]$previous.UpdatedAt, [ref]$previousUpdatedAt)
+                $separator = [string][char]31
+                $currentFingerprint = @(
+                    $Reason,
+                    $Stage,
+                    $Action,
+                    $Detail,
+                    ($decision.Resolution | ConvertTo-Json -Depth 6 -Compress),
+                    ($decision.Hdr | ConvertTo-Json -Depth 6 -Compress)
+                ) -join $separator
+                $previousFingerprint = @(
+                    [string]$previous.Reason,
+                    [string]$previous.Stage,
+                    [string]$previous.Action,
+                    [string]$previous.Detail,
+                    ($previous.Resolution | ConvertTo-Json -Depth 6 -Compress),
+                    ($previous.Hdr | ConvertTo-Json -Depth 6 -Compress)
+                ) -join $separator
+
+                if ($currentFingerprint -eq $previousFingerprint -and ($now - $previousUpdatedAt).TotalSeconds -lt 60) {
+                    return
+                }
+            }
+            catch {
+                Write-AppLog "Pipeline decision de-duplication could not read the previous decision: $($_.Exception.Message)"
+            }
         }
 
         $decision | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $pipelineDecisionFile -Encoding ascii -ErrorAction Stop
@@ -778,7 +833,8 @@ function Get-DisplayRepairBlockReason {
 function Invoke-StudioDisplayIntegratedRepair {
     param(
         [string]$Reason = "manual",
-        [switch]$Automatic
+        [switch]$Automatic,
+        [switch]$AllowForegroundCriticalRepair
     )
 
     $script:integratedRepairAttachedToExisting = $false
@@ -789,9 +845,12 @@ function Invoke-StudioDisplayIntegratedRepair {
     }
 
     $blockReason = Get-DisplayRepairBlockReason
-    if ($blockReason) {
+    if ($blockReason -and -not $AllowForegroundCriticalRepair) {
         Write-AppLog "Deferred integrated Studio Display repair for $Reason because $blockReason."
         return $false
+    }
+    elseif ($blockReason -and $AllowForegroundCriticalRepair) {
+        Write-AppLog "Foreground repair block '$blockReason' is being bypassed for $Reason because this is a hot-plug critical recovery and 5K/HDR is not yet stable."
     }
 
     try {
@@ -931,11 +990,12 @@ function Invoke-StudioDisplayDeepIntegratedRepair {
         [string]$TaskReason,
         [Parameter(Mandatory = $true)]
         [string]$LogDetail,
-        [switch]$Automatic
+        [switch]$Automatic,
+        [switch]$AllowForegroundCriticalRepair
     )
 
     $now = Get-Date
-    $started = Invoke-StudioDisplayIntegratedRepair -Reason $TaskReason -Automatic:$Automatic
+    $started = Invoke-StudioDisplayIntegratedRepair -Reason $TaskReason -Automatic:$Automatic -AllowForegroundCriticalRepair:$AllowForegroundCriticalRepair
     if ($started) {
         Set-StudioDisplayIntegratedRepairActive -StartedAt $now -Attached:$script:integratedRepairAttachedToExisting
         $repairAction = if ($script:integratedRepairAttachedToExisting) { "Attached to the already-running deep integrated display pipeline restore" } else { "Started deep integrated display pipeline restore" }
@@ -1541,6 +1601,43 @@ function Test-StudioDisplayResolutionModeTableBlocked {
     )
 }
 
+function Test-StudioDisplayModeTableStaleButVisible {
+    param(
+        [object]$ResolutionState
+    )
+
+    return [bool](
+        $ResolutionState -and
+        $ResolutionState.Known -and
+        $ResolutionState.HasCurrent5K -and
+        -not $ResolutionState.Has5K60Enumerated
+    )
+}
+
+function Get-StudioDisplayResolutionModeTableBackoffSeconds {
+    param(
+        [object]$ResolutionState
+    )
+
+    if (Test-StudioDisplayModeTableStaleButVisible -ResolutionState $ResolutionState) {
+        return $resolutionModeTableStaleBackoffSeconds
+    }
+
+    return $resolutionModeTableBlockedBackoffSeconds
+}
+
+function Get-StudioDisplayResolutionModeTableRetryLimit {
+    param(
+        [object]$ResolutionState
+    )
+
+    if (Test-StudioDisplayModeTableStaleButVisible -ResolutionState $ResolutionState) {
+        return $resolutionModeTableStaleRetryLimit
+    }
+
+    return $resolutionModeTableBlockedRetryLimit
+}
+
 function Save-StudioDisplayResolutionModeTableBlockState {
     param(
         [string]$Reason = "automatic"
@@ -1642,7 +1739,9 @@ function Set-StudioDisplayResolutionModeTableBlockedBackoff {
         $script:resolutionModeTableBlockedCount = 1
     }
 
-    $script:resolutionModeTableBlockedUntil = $now.AddSeconds($resolutionModeTableBlockedBackoffSeconds)
+    $backoffSeconds = Get-StudioDisplayResolutionModeTableBackoffSeconds -ResolutionState $ResolutionState
+    $retryLimit = Get-StudioDisplayResolutionModeTableRetryLimit -ResolutionState $ResolutionState
+    $script:resolutionModeTableBlockedUntil = $now.AddSeconds($backoffSeconds)
     $script:pendingHdrRepair = $true
     $script:lastResolutionModeTableBlockedLogAt = $now
     Save-StudioDisplayResolutionModeTableBlockState -Reason $Reason
@@ -1653,8 +1752,37 @@ function Set-StudioDisplayResolutionModeTableBlockedBackoff {
     else {
         "resolution state unknown"
     }
+    $blockKind = if (Test-StudioDisplayModeTableStaleButVisible -ResolutionState $ResolutionState) { "visible-5K stale mode table" } else { "hard degraded mode table" }
 
-    Write-AppLog "5K mode table blocked for $Reason. $resolutionText. Automatic deep repair attempt $($script:resolutionModeTableBlockedCount)/$resolutionModeTableBlockedRetryLimit did not make Windows expose 5120x2880. Backing off until $($script:resolutionModeTableBlockedUntil.ToString('HH:mm:ss')) instead of repeatedly restarting USB4; a fresh Thunderbolt reconnect, power resume, or successful 5K probe will clear this gate."
+    Write-AppLog "5K mode table blocked for $Reason ($blockKind). $resolutionText. Automatic deep repair attempt $($script:resolutionModeTableBlockedCount)/$retryLimit did not make Windows expose 5120x2880 in the game-visible mode table. Backing off ${backoffSeconds}s until $($script:resolutionModeTableBlockedUntil.ToString('HH:mm:ss')); a fresh Thunderbolt reconnect, power resume, or successful 5K probe will clear this gate."
+}
+
+function Clear-StudioDisplayExpiredRepairBackoffs {
+    param(
+        [string]$Reason = "automatic"
+    )
+
+    $now = Get-Date
+    if (
+        $script:resolutionModeTableBlockedUntil -and
+        $script:resolutionModeTableBlockedUntil -gt [DateTime]::MinValue -and
+        $now -ge $script:resolutionModeTableBlockedUntil
+    ) {
+        Reset-StudioDisplayResolutionModeTableBlock -Reason "$Reason 5K mode-table backoff expired"
+        $script:lastIntegratedRepairAt = [DateTime]::MinValue
+        Write-AppLog "5K mode-table backoff expired for $Reason. Resetting retry state so the next automatic pass performs a real Boot Camp-style rebuild instead of extending the failure."
+    }
+
+    if (
+        $script:hdrGateBlockedUntil -and
+        $script:hdrGateBlockedUntil -gt [DateTime]::MinValue -and
+        $now -ge $script:hdrGateBlockedUntil
+    ) {
+        Reset-StudioDisplayHdrGateBlock -Reason "$Reason HDR gate backoff expired"
+        $script:lastIntegratedRepairAt = [DateTime]::MinValue
+        $script:lastHdrActivationAt = [DateTime]::MinValue
+        Write-AppLog "HDR gate backoff expired for $Reason. Resetting retry state so HDR remains success-critical and the next automatic pass performs a real repair attempt."
+    }
 }
 
 function Get-StudioDisplayLatestIntegratedRepairLogInfo {
@@ -1798,15 +1926,10 @@ function Invoke-StudioDisplayHdrActivation {
         return $false
     }
 
-    $blockReason = Get-DisplayRepairBlockReason
-    if ($blockReason) {
-        $script:pendingHdrRepair = $true
-        Write-AppLog "Deferred display pipeline restore for $Reason because $blockReason."
-        Save-StudioDisplayPipelineDecision -Reason $Reason -Stage "BlockedByForegroundPolicy" -Action "Defer" -Detail $blockReason
-        return $false
-    }
-
     $now = Get-Date
+    Clear-StudioDisplayExpiredRepairBackoffs -Reason $Reason
+    $now = Get-Date
+
     if ($script:integratedRepairUnavailableUntil -and $now -lt $script:integratedRepairUnavailableUntil) {
         $script:pendingHdrRepair = $true
         if (($now - $script:lastIntegratedRepairCooldownLogAt).TotalSeconds -ge 60) {
@@ -1818,6 +1941,24 @@ function Invoke-StudioDisplayHdrActivation {
     }
 
     $resolutionState = Get-StudioDisplayResolutionRuntimeState
+    $state = Get-StudioDisplayHdrRuntimeState
+    $pipelineAlreadyStable = Test-StudioDisplayPipelineStable -ResolutionState $resolutionState -HdrState $state
+    $allowForegroundCriticalRepair = [bool](
+        $Automatic -and
+        $Reason -match 'hot-plug|resume|connect|startup|Thunderbolt' -and
+        -not $pipelineAlreadyStable
+    )
+    $blockReason = Get-DisplayRepairBlockReason
+    if ($blockReason -and -not $allowForegroundCriticalRepair) {
+        $script:pendingHdrRepair = $true
+        Write-AppLog "Deferred display pipeline restore for $Reason because $blockReason."
+        Save-StudioDisplayPipelineDecision -Reason $Reason -Stage "BlockedByForegroundPolicy" -Action "Defer" -Detail $blockReason
+        return $false
+    }
+    elseif ($blockReason -and $allowForegroundCriticalRepair) {
+        Write-AppLog "Continuing hot-plug critical display pipeline restore for $Reason despite foreground block '$blockReason' because current 5K/HDR is not stable. This keeps HDR success above speed/comfort during recovery tests."
+    }
+
     $resolutionNeedsDeepRepair = (
         -not $resolutionState.Known -or
         -not $resolutionState.HasCurrent5K -or
@@ -1842,7 +1983,8 @@ function Invoke-StudioDisplayHdrActivation {
             return $false
         }
 
-        if ($script:resolutionModeTableBlockedCount -ge $resolutionModeTableBlockedRetryLimit) {
+        $resolutionRetryLimit = Get-StudioDisplayResolutionModeTableRetryLimit -ResolutionState $resolutionState
+        if ($script:resolutionModeTableBlockedCount -ge $resolutionRetryLimit) {
             Set-StudioDisplayResolutionModeTableBlockedBackoff -Reason "$Reason retry limit" -ResolutionState $resolutionState
             Save-StudioDisplayPipelineDecision -Reason $Reason -Stage "ResolutionModeTableRetryLimit" -Action "Backoff" -Detail "5K60 mode table is still degraded after retry limit." -ResolutionState $resolutionState
             return $false
@@ -1863,12 +2005,12 @@ function Invoke-StudioDisplayHdrActivation {
         return Invoke-StudioDisplayDeepIntegratedRepair `
             -TaskReason "$Reason (resolution/HDR ladder restore)" `
             -LogDetail "The 5K ladder is not stable; HDR will stay pending until verification succeeds." `
-            -Automatic:$Automatic
+            -Automatic:$Automatic `
+            -AllowForegroundCriticalRepair:$allowForegroundCriticalRepair
     }
 
     Reset-StudioDisplayResolutionModeTableBlock -Reason "$Reason 5K mode table recovered"
 
-    $state = Get-StudioDisplayHdrRuntimeState
     if ($state.HdrActive) {
         $script:pendingHdrRepair = $false
         Reset-StudioDisplayHdrGateBlock -Reason "$Reason HDR active"
@@ -1947,7 +2089,8 @@ function Invoke-StudioDisplayHdrActivation {
     return Invoke-StudioDisplayDeepIntegratedRepair `
         -TaskReason "$Reason (HDR gate restore)" `
         -LogDetail "Gate: $gateText. HDR will stay pending until verification succeeds." `
-        -Automatic:$Automatic
+        -Automatic:$Automatic `
+        -AllowForegroundCriticalRepair:$allowForegroundCriticalRepair
 }
 
 function Show-StudioDisplayHdrBrightnessContext {
@@ -2510,6 +2653,7 @@ try {
                 }
                 elseif ($repairDueToTopologyChange) {
                     $script:lastHdrActivationAt = [DateTime]::MinValue
+                    Reset-StudioDisplayHdrGateBlock -Reason $repairReason
                 }
 
                 $script:lastDisplayRepairAt = Get-Date
@@ -2539,13 +2683,23 @@ try {
         & $updateUi
     })
 
-    Start-BrightnessServices | Out-Null
-    if (Test-StudioDisplayConnected) {
+    $startupStudioDisplayConnected = Test-StudioDisplayConnected
+    if (-not $startupStudioDisplayConnected) {
+        Start-BrightnessServices | Out-Null
+    }
+
+    if ($startupStudioDisplayConnected) {
         $script:lastDisplayRepairAt = Get-Date
         $script:pendingHdrRepair = $true
         Save-StudioDisplayPipelineDecision -Reason "tray startup HDR restore" -Stage "StartupProbe" -Action "ProbeAndDecide" -Detail "The tray started while Studio Display evidence is present; probing current gates before deciding whether to rebuild."
         Start-StudioDisplayPassiveHotplugObserver -Reason "tray startup HDR restore" | Out-Null
-        Invoke-StudioDisplayHdrActivation -Reason "tray startup HDR restore" -Automatic | Out-Null
+        $startupRepairReady = Invoke-StudioDisplayHdrActivation -Reason "tray startup HDR restore" -Automatic
+        if ($startupRepairReady -and -not (Test-StudioDisplayDeepRepairActive)) {
+            Start-BrightnessServices | Out-Null
+        }
+        else {
+            Write-AppLog "Startup brightness service start deferred because Studio Display is connected and the 5K/HDR pipeline is still pending. The integrated repair will restore brightness after HDR/5K gates finish."
+        }
         $script:lastStudioDisplayConnected = $true
         $script:lastDisplayTopologySignature = Get-DisplayTopologySignature
     }

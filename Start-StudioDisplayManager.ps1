@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 $installRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools\StudioDisplayManager"
 $managerTarget = Join-Path $installRoot "StudioDisplayManager.ps1"
 $managerPidFile = Join-Path $installRoot "StudioDisplayManager.pid"
+$managerLogPath = Join-Path $installRoot "SystemBrightnessMirror.log"
 $powershellExe = Join-Path $PSHOME "powershell.exe"
 $appName = "Studio Display XDR Win Controller"
 
@@ -51,20 +52,51 @@ function Remove-StaleManagerPidFile {
     return $false
 }
 
+function Restore-ManagerPidFileFromLog {
+    if (-not (Test-Path -LiteralPath $managerLogPath)) {
+        return $false
+    }
+
+    try {
+        $candidateLines = @(Get-Content -LiteralPath $managerLogPath -Tail 400 -ErrorAction Stop)
+        [array]::Reverse($candidateLines)
+        foreach ($line in $candidateLines) {
+            if ($line -notmatch 'tray started with PID\s+(\d+)') {
+                continue
+            }
+
+            $candidatePid = [int]$Matches[1]
+            $process = Get-Process -Id $candidatePid -ErrorAction SilentlyContinue
+            if (-not $process) {
+                continue
+            }
+
+            Set-Content -LiteralPath $managerPidFile -Value ([string]$candidatePid) -Encoding ascii -ErrorAction Stop
+            Write-Host "$appName adopted existing tray process PID $candidatePid from log."
+            return $true
+        }
+    }
+    catch {
+        Write-Warning "$appName could not adopt an existing tray process from the log: $($_.Exception.Message)"
+    }
+
+    return $false
+}
+
 function Test-ManagerRunning {
     if (-not (Test-Path $managerPidFile)) {
-        return $false
+        return (Restore-ManagerPidFileFromLog)
     }
 
     $existingPid = Get-Content -LiteralPath $managerPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $existingPid) {
         [void](Remove-StaleManagerPidFile)
-        return $false
+        return (Restore-ManagerPidFileFromLog)
     }
 
     if ($existingPid -notmatch '^\d+$') {
         [void](Remove-StaleManagerPidFile)
-        return $false
+        return (Restore-ManagerPidFileFromLog)
     }
 
     $process = Get-Process -Id ([int]$existingPid) -ErrorAction SilentlyContinue
@@ -73,7 +105,7 @@ function Test-ManagerRunning {
     }
 
     [void](Remove-StaleManagerPidFile)
-    return $false
+    return (Restore-ManagerPidFileFromLog)
 }
 
 function Wait-ManagerRunning {
@@ -112,5 +144,10 @@ Start-Sleep -Seconds 5
 if (Wait-ManagerRunning -TimeoutSeconds 15) {
     Write-Host "$appName started."
 } else {
+    if (Restore-ManagerPidFileFromLog) {
+        Write-Host "$appName adopted an already-running tray after startup."
+        exit 0
+    }
+
     throw "$appName did not start successfully."
 }

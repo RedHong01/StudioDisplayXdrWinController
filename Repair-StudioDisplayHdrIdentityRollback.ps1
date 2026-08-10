@@ -4,6 +4,7 @@ param(
     [switch]$Elevate,
     [switch]$AllowMonitorDeviceRemoval,
     [switch]$RollbackOnResolutionLoss = $true,
+    [switch]$RestoreBootCampOnHdrFailure,
     [string]$LogPath
 )
 
@@ -46,7 +47,7 @@ function Start-ElevatedSelf {
         "-LogPath", "`"$LogPath`""
     )
 
-    foreach ($switchName in @("Apply", "AllowMonitorDeviceRemoval", "RollbackOnResolutionLoss")) {
+    foreach ($switchName in @("Apply", "AllowMonitorDeviceRemoval", "RollbackOnResolutionLoss", "RestoreBootCampOnHdrFailure")) {
         if ((Get-Variable -Name $switchName -ValueOnly)) {
             $arguments += "-$switchName"
         }
@@ -360,7 +361,7 @@ function Restore-WcgFallbackIfNeeded {
     return $updatedHdr
 }
 
-Write-RollbackLog "Studio Display HDR identity rollback started. Apply=$Apply Elevated=$(Test-IsAdministrator) AllowMonitorDeviceRemoval=$AllowMonitorDeviceRemoval RollbackOnResolutionLoss=$RollbackOnResolutionLoss"
+Write-RollbackLog "Studio Display HDR identity rollback started. Apply=$Apply Elevated=$(Test-IsAdministrator) AllowMonitorDeviceRemoval=$AllowMonitorDeviceRemoval RollbackOnResolutionLoss=$RollbackOnResolutionLoss RestoreBootCampOnHdrFailure=$RestoreBootCampOnHdrFailure"
 
 if ($Apply -and -not (Test-IsAdministrator)) {
     if ($Elevate) {
@@ -451,6 +452,17 @@ if ($postHdr.HdrSupported -and -not $postHdr.HdrActive -and (Test-Path -LiteralP
 if ($postHdr.HdrActive) {
     Write-RollbackLog "HDR identity rollback succeeded: 5K60 is stable and ActiveColorMode=HDR."
     exit 0
+}
+
+if ($RestoreBootCampOnHdrFailure) {
+    Write-RollbackLog "HDR identity rollback did not reopen the HDR gate. Restoring the Boot Camp-style monitor fallback before returning failure so later hot-plug cycles keep the known 5K60 fallback available."
+    if (Restore-BootCampStyleFallback) {
+        Write-RollbackLog "Boot Camp-style fallback restored after HDR identity rollback failure."
+        exit 3
+    }
+
+    Write-RollbackLog "Boot Camp-style fallback restore failed after HDR identity rollback failure."
+    exit 4
 }
 
 $postHdr = Restore-WcgFallbackIfNeeded -HdrState $postHdr

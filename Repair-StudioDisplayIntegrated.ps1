@@ -21,6 +21,7 @@ $externalModeRepairScript = Join-Path $scriptRoot "Repair-StudioDisplayExternalM
 $linkRefreshScript = Join-Path $scriptRoot "Refresh-StudioDisplayXdrLink.ps1"
 $bootCampDriverScript = Join-Path $scriptRoot "Install-StudioDisplayBootCampStyleMonitorDriver.ps1"
 $appleUsbInterfaceRepairScript = Join-Path $scriptRoot "Repair-StudioDisplayAppleUsbInterfaces.ps1"
+$hdrIdentityRollbackScript = Join-Path $scriptRoot "Repair-StudioDisplayHdrIdentityRollback.ps1"
 $hdrStateScript = Join-Path $scriptRoot "Set-StudioDisplayHdrState.ps1"
 $advancedColorScript = Join-Path $scriptRoot "Get-StudioDisplayAdvancedColorState.ps1"
 $brightnessHidScript = Join-Path $scriptRoot "StudioDisplayHid.ps1"
@@ -40,6 +41,12 @@ Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 $script:effectiveEnsureBootCampMonitorDriver = [bool]$EnsureBootCampMonitorDriver
 $script:bootCampModeTableRebindAttempted = $false
 $script:modeTableRegistryNudgeAttempted = $false
+$script:bootCampDriverSkippedBecauseIdentityReady = $false
+$script:bootCampDriverSuccessFallbackAttempted = $false
+$script:stageTimings = New-Object System.Collections.Generic.List[object]
+$script:overallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$modeTableRecoveryWaitSeconds = 60
+$modeTableRecoveryPollSeconds = 5
 
 if (-not $LogPath) {
     New-Item -ItemType Directory -Force -Path $reportsRoot -ErrorAction SilentlyContinue | Out-Null
@@ -52,6 +59,90 @@ function Write-RepairLog {
     $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"), $Message
     Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
+}
+
+function Add-RepairStageTiming {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [string]$Kind = "stage",
+        [Parameter(Mandatory = $true)]
+        [TimeSpan]$Elapsed,
+        [AllowNull()][object]$ExitCode = $null,
+        [bool]$TimedOut = $false,
+        [string]$Result = ""
+    )
+
+    $entry = [ordered]@{
+        Timestamp = (Get-Date).ToString("o")
+        Label = $Label
+        Kind = $Kind
+        DurationMs = [int][Math]::Round($Elapsed.TotalMilliseconds)
+        DurationSec = [Math]::Round($Elapsed.TotalSeconds, 3)
+        ExitCode = $ExitCode
+        TimedOut = $TimedOut
+        Result = $Result
+    }
+
+    $script:stageTimings.Add([pscustomobject]$entry) | Out-Null
+    Write-RepairLog ("TIMING label=`"{0}`" kind={1} durationMs={2} durationSec={3} exitCode={4} timedOut={5} result={6}" -f $Label, $Kind, $entry.DurationMs, $entry.DurationSec, $ExitCode, $TimedOut, $Result)
+}
+
+function Invoke-RepairStage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock
+    )
+
+    $stageStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $result = $null
+    $stageResult = "completed"
+    try {
+        $result = & $ScriptBlock
+        return $result
+    }
+    catch {
+        $stageResult = "error: $($_.Exception.Message)"
+        throw
+    }
+    finally {
+        $stageStopwatch.Stop()
+        Add-RepairStageTiming -Label $Label -Kind "stage" -Elapsed $stageStopwatch.Elapsed -Result $stageResult
+    }
+}
+
+function Write-RepairTimingSummary {
+    param([int]$FinalExitCode)
+
+    try {
+        if ($script:overallStopwatch.IsRunning) {
+            $script:overallStopwatch.Stop()
+        }
+
+        $timingPath = [System.IO.Path]::ChangeExtension($LogPath, ".timings.json")
+        $summary = [ordered]@{
+            Version = 1
+            FinishedAt = (Get-Date).ToString("o")
+            FinalExitCode = $FinalExitCode
+            TotalDurationMs = [int][Math]::Round($script:overallStopwatch.Elapsed.TotalMilliseconds)
+            TotalDurationSec = [Math]::Round($script:overallStopwatch.Elapsed.TotalSeconds, 3)
+            Stages = @($script:stageTimings.ToArray())
+        }
+
+        $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $timingPath -Encoding utf8 -ErrorAction Stop
+        $slowest = @($script:stageTimings.ToArray() | Sort-Object DurationMs -Descending | Select-Object -First 5)
+        if ($slowest.Count -gt 0) {
+            Write-RepairLog "Timing summary written to $timingPath. Slowest stages: $((@($slowest | ForEach-Object { '{0}={1}s' -f $_.Label, $_.DurationSec }) -join '; '))"
+        }
+        else {
+            Write-RepairLog "Timing summary written to $timingPath."
+        }
+    }
+    catch {
+        Write-RepairLog "Could not write timing summary: $($_.Exception.Message)"
+    }
 }
 
 function Test-IsAdministrator {
@@ -97,16 +188,40 @@ function Invoke-Tool {
     )
 
     Write-RepairLog "Running $Label."
+    $toolStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $safeLabel = ($Label -replace '[^A-Za-z0-9._-]', '_')
     $captureId = [Guid]::NewGuid().ToString("N")
     $stdoutPath = Join-Path $env:TEMP ("StudioDisplay-{0}-{1}-{2}.out.log" -f $safeLabel, $PID, $captureId)
     $stderrPath = Join-Path $env:TEMP ("StudioDisplay-{0}-{1}-{2}.err.log" -f $safeLabel, $PID, $captureId)
+    $exitCodePath = Join-Path $env:TEMP ("StudioDisplay-{0}-{1}-{2}.exit" -f $safeLabel, $PID, $captureId)
+    $wrapperPath = Join-Path $env:TEMP ("StudioDisplay-{0}-{1}-{2}.wrapper.ps1" -f $safeLabel, $PID, $captureId)
     $output = @()
     $exitCode = 1
     $timedOut = $false
 
     try {
-        $process = Start-Process -FilePath $powershellExe -ArgumentList $Arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
+        $escapedPowerShellExe = $powershellExe.Replace("'", "''")
+        $escapedExitCodePath = $exitCodePath.Replace("'", "''")
+        $argumentLiteralBlock = (($Arguments | ForEach-Object {
+            "    '{0}'" -f ([string]$_).Replace("'", "''")
+        }) -join ",`r`n")
+        $wrapper = @"
+`$ErrorActionPreference = 'Continue'
+`$toolArguments = @(
+$argumentLiteralBlock
+)
+& '$escapedPowerShellExe' @toolArguments
+`$toolExitCode = if (`$null -ne `$global:LASTEXITCODE) { [int]`$global:LASTEXITCODE } elseif (`$?) { 0 } else { 1 }
+Set-Content -LiteralPath '$escapedExitCodePath' -Value ([string]`$toolExitCode) -Encoding ascii
+exit `$toolExitCode
+"@
+        Set-Content -LiteralPath $wrapperPath -Value $wrapper -Encoding ascii -ErrorAction Stop
+
+        $process = Start-Process -FilePath $powershellExe -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $wrapperPath
+        ) -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
         $startedAt = Get-Date
         $lastHeartbeatAt = $startedAt
 
@@ -146,8 +261,46 @@ function Invoke-Tool {
             $exitCode = 124
         }
         else {
+            try {
+                $process.WaitForExit() | Out-Null
+            }
+            catch {
+                Write-RepairLog "$Label final WaitForExit failed: $($_.Exception.Message)"
+            }
+
+            $sidecarExitCode = $null
+            if (Test-Path -LiteralPath $exitCodePath) {
+                $sidecarText = (Get-Content -LiteralPath $exitCodePath -ErrorAction SilentlyContinue | Select-Object -First 1)
+                if ($sidecarText -match '^-?\d+$') {
+                    $sidecarExitCode = [int]$sidecarText
+                }
+            }
+
             $process.Refresh()
-            $exitCode = $process.ExitCode
+            $rawExitCode = $null
+            try {
+                $rawExitCode = $process.ExitCode
+            }
+            catch {
+                Write-RepairLog "$Label completed, but process ExitCode could not be read: $($_.Exception.Message)"
+            }
+
+            if ($null -ne $sidecarExitCode) {
+                $exitCode = $sidecarExitCode
+                if ($null -eq $rawExitCode -or [string]::IsNullOrWhiteSpace([string]$rawExitCode)) {
+                    Write-RepairLog "$Label completed without a readable Start-Process exit code; using child-reported exit code $exitCode from the wrapper sidecar."
+                }
+                elseif ([int]$rawExitCode -ne $exitCode) {
+                    Write-RepairLog "$Label Start-Process exit code $rawExitCode differed from child-reported exit code $exitCode; using the child-reported value for repair gating."
+                }
+            }
+            elseif ($null -eq $rawExitCode -or [string]::IsNullOrWhiteSpace([string]$rawExitCode)) {
+                $exitCode = 1
+                Write-RepairLog "$Label completed but did not expose a process exit code and no child-reported sidecar was written; treating this as failure so HDR/USB gates are not accidentally accepted."
+            }
+            else {
+                $exitCode = [int]$rawExitCode
+            }
         }
 
         if (Test-Path -LiteralPath $stdoutPath) {
@@ -165,6 +318,8 @@ function Invoke-Tool {
     finally {
         Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $exitCodePath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $wrapperPath -Force -ErrorAction SilentlyContinue
     }
 
     foreach ($line in $output) {
@@ -177,6 +332,10 @@ function Invoke-Tool {
     else {
         Write-RepairLog "$Label exit code: $exitCode"
     }
+
+    $toolStopwatch.Stop()
+    $resultText = if ($timedOut) { "timeout" } elseif ($exitCode -eq 0) { "ok" } else { "exit-$exitCode" }
+    Add-RepairStageTiming -Label $Label -Kind "tool" -Elapsed $toolStopwatch.Elapsed -ExitCode $exitCode -TimedOut $timedOut -Result $resultText
 
     return [pscustomobject]@{
         ExitCode = $exitCode
@@ -756,6 +915,52 @@ function Get-ResolutionLadderState {
     }
 }
 
+function Wait-For5K60ModeTableRecovery {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ResolutionState,
+        [string]$Reason = "mode-table recovery",
+        [int]$TimeoutSeconds = $modeTableRecoveryWaitSeconds,
+        [int]$PollSeconds = $modeTableRecoveryPollSeconds
+    )
+
+    if ($ResolutionState.Has5K60Enumerated) {
+        return $ResolutionState
+    }
+
+    if (-not $ResolutionState.HasCurrent5K) {
+        Write-RepairLog "5K60 mode-table settle wait skipped for $Reason because the current Studio Display mode is not 5K. $($ResolutionState.Summary)"
+        return $ResolutionState
+    }
+
+    if ($TimeoutSeconds -le 0) {
+        return $ResolutionState
+    }
+
+    $lastState = $ResolutionState
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    Write-RepairLog "5K60 is still missing from the Windows mode table after $Reason. Success-first mode will wait up to ${TimeoutSeconds}s for delayed USB4/EDID enumeration before allowing the pipeline to fail."
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds ([Math]::Max(1, $PollSeconds))
+        $lastState = Get-ResolutionLadderState
+        Write-RepairLog "5K60 mode-table settle poll: $($lastState.Summary)"
+
+        if ($lastState.Has5K60Enumerated) {
+            Write-RepairLog "5K60 mode table recovered during settle wait after $Reason. Continuing to external-only/HDR gates."
+            return $lastState
+        }
+
+        if (-not $lastState.HasCurrent5K) {
+            Write-RepairLog "5K60 mode-table settle wait stopped because the active 5K display mode disappeared. $($lastState.Summary)"
+            return $lastState
+        }
+    }
+
+    Write-RepairLog "5K60 mode table did not recover during the ${TimeoutSeconds}s settle wait after $Reason. Final validation will keep exit code non-zero; automation must continue observing/retrying instead of accepting WCG/1080 fallback."
+    return $lastState
+}
+
 function Invoke-LinkRefreshIfNeeded {
     param([object]$InitialState)
 
@@ -806,7 +1011,7 @@ function Invoke-LinkRefreshIfNeeded {
         $refreshArgs += "-RestartAppleUsb4Router"
     }
 
-    Invoke-Tool -Label "Studio Display XDR link refresh" -Arguments $refreshArgs | Out-Null
+    Invoke-Tool -Label "Studio Display XDR link refresh" -Arguments $refreshArgs -TimeoutSeconds 240 | Out-Null
     Start-Sleep -Seconds 3
     return Get-ResolutionLadderState
 }
@@ -839,7 +1044,7 @@ function Invoke-BootCampDriverIfRequested {
         "-Apply",
         "-OutputDirectory", $driverOutputDirectory,
         "-LogPath", $driverLogPath
-    ) | Out-Null
+    ) -TimeoutSeconds 240 | Out-Null
 }
 
 function Wait-BootCampStyleMonitorIdentity {
@@ -1050,7 +1255,49 @@ function Invoke-AppleUsbInterfaceRepair {
         $usbArgs += "-Elevate"
     }
 
-    return Invoke-Tool -Label "Apple USB/HID interface repair" -Arguments $usbArgs
+    return Invoke-Tool -Label "Apple USB/HID interface repair" -Arguments $usbArgs -TimeoutSeconds 90
+}
+
+function Invoke-HdrIdentityRollbackRepair {
+    if ($SkipHdr) {
+        Write-RepairLog "HDR identity rollback skipped because HDR repair is disabled."
+        return [pscustomobject]@{
+            ExitCode = 0
+            Output = @()
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $hdrIdentityRollbackScript)) {
+        Write-RepairLog "HDR identity rollback script is missing: $hdrIdentityRollbackScript"
+        return [pscustomobject]@{
+            ExitCode = 1
+            Output = @()
+        }
+    }
+
+    if (-not $Apply) {
+        Write-RepairLog "Dry run: HDR identity rollback would test APPA/Generic PnP rebinding after MS_0001 keeps HighDynamicRangeSupported=False."
+        return [pscustomobject]@{
+            ExitCode = 0
+            Output = @()
+        }
+    }
+
+    $rollbackArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $hdrIdentityRollbackScript,
+        "-Apply",
+        "-AllowMonitorDeviceRemoval",
+        "-RestoreBootCampOnHdrFailure",
+        "-LogPath", $LogPath
+    )
+
+    if (-not (Test-IsAdministrator)) {
+        $rollbackArgs += "-Elevate"
+    }
+
+    return Invoke-Tool -Label "HDR identity rollback" -Arguments $rollbackArgs -TimeoutSeconds 360
 }
 
 function Invoke-HdrRepair {
@@ -1094,7 +1341,7 @@ function Invoke-HdrRepair {
         Write-RepairLog "HDR gate is still closed; WCG/Advanced Color fallback was not requested because default repair must not downgrade HDR intent. Pass -AllowWcgFallback only for explicit WCG diagnostics."
     }
 
-    return Invoke-Tool -Label "HDR state repair" -Arguments $hdrArgs
+    return Invoke-Tool -Label "HDR state repair" -Arguments $hdrArgs -TimeoutSeconds 90
 }
 
 function Format-HdrRuntimeState {
@@ -1155,7 +1402,7 @@ function Get-HdrRuntimeState {
         "-ExecutionPolicy", "Bypass",
         "-File", $advancedColorScript,
         "-SkipDxDiagFallback"
-    )
+    ) -TimeoutSeconds 60
     $joined = ($result.Output -join "`n")
     return [pscustomobject]@{
         Known = [bool]($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($joined))
@@ -1179,9 +1426,15 @@ function Test-BrightnessHidReadyQuiet {
     }
 
     try {
-        $output = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $brightnessHidScript -GetPercent 2>&1)
+        $result = Invoke-Tool -Label "brightness HID quiet get" -Arguments @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $brightnessHidScript,
+            "-GetPercent"
+        ) -TimeoutSeconds 30
+        $output = @($result.Output)
         $joined = ($output -join "`n")
-        return [bool]($LASTEXITCODE -eq 0 -and $joined -match '(?m)^\s*\d+\s*$')
+        return [bool]($result.ExitCode -eq 0 -and $joined -match '(?m)^\s*\d+\s*$')
     }
     catch {
         return $false
@@ -1204,7 +1457,7 @@ function Invoke-BrightnessValidation {
         "-ExecutionPolicy", "Bypass",
         "-File", $brightnessHidScript,
         "-GetPercent"
-    )
+    ) -TimeoutSeconds 30
 
     if ($getResult.ExitCode -eq 0) {
         return $true
@@ -1228,7 +1481,7 @@ function Invoke-BrightnessValidation {
         "-ExecutionPolicy", "Bypass",
         "-File", $brightnessHidScript,
         "-GetPercent"
-    )
+    ) -TimeoutSeconds 30
 
     return [bool]($retryResult.ExitCode -eq 0)
 }
@@ -1242,8 +1495,8 @@ function Invoke-AdvancedColorValidation {
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", $advancedColorScript,
-        "-IncludeDxDiag"
-    ) | Out-Null
+        "-SkipDxDiagFallback"
+    ) -TimeoutSeconds 75 | Out-Null
 }
 
 Write-RepairLog "Studio Display integrated repair started. Apply=$Apply Elevated=$(Test-IsAdministrator)"
@@ -1267,50 +1520,86 @@ $hdrRepairFailed = $false
 $brightnessValidationFailed = $false
 
 try {
-    $initialState = Get-ResolutionLadderState
+    $initialState = Invoke-RepairStage -Label "Initial resolution state probe" -ScriptBlock { Get-ResolutionLadderState }
     Write-RepairLog "Initial resolution state: $($initialState.Summary)"
 
-    $bootCampFallbackState = Get-BootCampStyleMonitorFallbackState
+    $bootCampFallbackState = Invoke-RepairStage -Label "Boot Camp-style identity preflight" -ScriptBlock { Get-BootCampStyleMonitorFallbackState }
     Write-RepairLog "Boot Camp-style monitor fallback preflight: $($bootCampFallbackState.Summary)"
     if (-not $script:effectiveEnsureBootCampMonitorDriver -and $bootCampFallbackState.NeedsBootCampRefresh) {
         $script:effectiveEnsureBootCampMonitorDriver = $true
         Write-RepairLog "Boot Camp-style monitor driver refresh enabled automatically because active MS_0001 must use the Boot Camp-style identity before HDR."
     }
     elseif (-not $script:effectiveEnsureBootCampMonitorDriver -and $bootCampFallbackState.ActiveMs0001 -and $bootCampFallbackState.BootCampStyleReady -and -not $initialState.Has5K60Enumerated) {
-        $script:effectiveEnsureBootCampMonitorDriver = $true
-        Write-RepairLog "Boot Camp-style monitor driver refresh enabled because active MS_0001 is bound to the Boot Camp-style identity but Windows still has no enumerated 5K60 mode table. Rebuilding the monitor INF transaction before USB4 retraining instead of keeping the fast visible fallback state."
+        $script:bootCampDriverSkippedBecauseIdentityReady = $true
+        Write-RepairLog "Boot Camp-style monitor identity is already bound with HDR metadata, but Windows has not published 5K60 into the mode table. Treating this as a link/mode-table problem and going straight to USB4 retraining instead of reinstalling the monitor INF again."
     }
     elseif ($bootCampFallbackState.ActiveMs0001 -and $bootCampFallbackState.BootCampStyleReady) {
         Write-RepairLog "Boot Camp-style monitor identity is already installed and bound; the generic monitor.inf fallback will not be used as an HDR path."
     }
 
-    $brightnessState = Suspend-BrightnessServicesForRepair
+    $brightnessState = Invoke-RepairStage -Label "Suspend brightness services" -ScriptBlock { Suspend-BrightnessServicesForRepair }
 
-    Invoke-BootCampDriverIfRequested
-    $externalOnlyAlreadyReady = [bool]($initialState.HasCurrent5K -and $initialState.Has5K60Enumerated -and (Test-ExternalOnlyScreenTopologyReady))
-    if ($externalOnlyAlreadyReady -and -not $ForceLinkRefresh -and -not $script:effectiveEnsureBootCampMonitorDriver) {
+    Invoke-RepairStage -Label "Boot Camp-style monitor driver gate" -ScriptBlock { Invoke-BootCampDriverIfRequested } | Out-Null
+    $externalOnlyAlreadyReady = [bool]($initialState.HasCurrent5K -and $initialState.Has5K60Enumerated -and (Invoke-RepairStage -Label "External-only topology preflight" -ScriptBlock { Test-ExternalOnlyScreenTopologyReady }))
+    if (-not $initialState.Has5K60Enumerated) {
+        $externalOnlyReady = $false
+        Write-RepairLog "External-only topology repair deferred because 5K60 is not enumerated yet. USB4/link refresh is required first; running topology repair before the mode table is restored only repeats a known unstable-display failure path."
+    }
+    elseif ($externalOnlyAlreadyReady -and -not $ForceLinkRefresh -and -not $script:effectiveEnsureBootCampMonitorDriver) {
         $externalOnlyReady = $true
         Write-RepairLog "External-only topology and 5K60 are already ready. Skipping external-only topology repair to avoid unnecessary black-screen/display-mode churn."
     }
     else {
-        $externalOnlyReady = Invoke-ExternalOnlyTopologyRepair
+        $externalOnlyReady = Invoke-RepairStage -Label "External-only topology repair gate" -ScriptBlock { Invoke-ExternalOnlyTopologyRepair }
     }
 
-    $postRefreshState = Invoke-LinkRefreshIfNeeded -InitialState $initialState
+    $postRefreshState = Invoke-RepairStage -Label "USB4/link refresh gate" -ScriptBlock { Invoke-LinkRefreshIfNeeded -InitialState $initialState }
     Write-RepairLog "Post-refresh resolution state: $($postRefreshState.Summary)"
-    $bootCampIdentityState = Wait-BootCampStyleMonitorIdentity
-    $postRefreshState = Invoke-BootCampModeTableRebindIfNeeded -ResolutionState $postRefreshState -IdentityState $bootCampIdentityState
-    if ($script:bootCampModeTableRebindAttempted) {
-        $bootCampIdentityState = Wait-BootCampStyleMonitorIdentity
+    if (-not $postRefreshState.Has5K60Enumerated -and $script:bootCampDriverSkippedBecauseIdentityReady -and -not $script:bootCampDriverSuccessFallbackAttempted) {
+        $script:bootCampDriverSuccessFallbackAttempted = $true
+        $previousEnsure = $script:effectiveEnsureBootCampMonitorDriver
+        $script:effectiveEnsureBootCampMonitorDriver = $true
+        Write-RepairLog "Success-first fallback: 5K60 is still missing after the fast USB4 retrain, so the skipped Boot Camp-style monitor INF reinstall will now run before one more link refresh. Speed never overrides the recovery gate."
+        try {
+            Invoke-RepairStage -Label "Boot Camp-style monitor driver success fallback" -ScriptBlock { Invoke-BootCampDriverIfRequested } | Out-Null
+            Invoke-RepairStage -Label "Boot Camp-style identity settle after success fallback" -ScriptBlock { Wait-BootCampStyleMonitorIdentity -TimeoutSeconds 20 } | Out-Null
+            $postRefreshState = Invoke-RepairStage -Label "USB4/link refresh after Boot Camp fallback" -ScriptBlock { Invoke-LinkRefreshIfNeeded -InitialState $postRefreshState }
+            Write-RepairLog "Post-success-fallback resolution state: $($postRefreshState.Summary)"
+
+            if (-not $postRefreshState.Has5K60Enumerated) {
+                $script:bootCampModeTableRebindAttempted = $true
+                Write-RepairLog "Boot Camp-style monitor INF and USB4 link refresh have already been retried in the success-first fallback for this transaction. Skipping the duplicate mode-table rebind pass and moving to the settle/validation gate."
+            }
+        }
+        finally {
+            $script:effectiveEnsureBootCampMonitorDriver = $previousEnsure
+        }
     }
-    $postRefreshState = Invoke-ModeTableRegistryNudgeIfNeeded -ResolutionState $postRefreshState -IdentityState $bootCampIdentityState
+
+    $bootCampIdentityState = Invoke-RepairStage -Label "Boot Camp-style identity settle" -ScriptBlock { Wait-BootCampStyleMonitorIdentity }
+    $postRefreshState = Invoke-RepairStage -Label "Boot Camp-style mode-table rebind gate" -ScriptBlock { Invoke-BootCampModeTableRebindIfNeeded -ResolutionState $postRefreshState -IdentityState $bootCampIdentityState }
+    if ($script:bootCampModeTableRebindAttempted) {
+        $bootCampIdentityState = Invoke-RepairStage -Label "Boot Camp-style identity settle after rebind" -ScriptBlock { Wait-BootCampStyleMonitorIdentity }
+    }
+    $postRefreshState = Invoke-RepairStage -Label "5K60 mode-table registry nudge gate" -ScriptBlock { Invoke-ModeTableRegistryNudgeIfNeeded -ResolutionState $postRefreshState -IdentityState $bootCampIdentityState }
     if ($postRefreshState.HasCurrent5K -and -not $postRefreshState.Has5K60Enumerated -and $postRefreshState.Has5K60Accepted) {
         Write-RepairLog "Current display is already 5K60 and CDS_TEST accepts 5K60, but 5K60 is not enumerated in the mode table. Treating this as unstable for HDR/game mode lists; run the elevated USB4/monitor restart path before HDR repair."
     }
 
+    $postRefreshState = Invoke-RepairStage -Label "5K60 mode-table settle wait" -ScriptBlock { Wait-For5K60ModeTableRecovery -ResolutionState $postRefreshState -Reason "Boot Camp-style USB4 refresh" }
+
     if (-not $externalOnlyReady -and $postRefreshState.Has5K60Enumerated) {
-        Write-RepairLog "5K60 is now enumerated after link refresh. Re-running external-only topology repair before HDR."
-        $externalOnlyReady = Invoke-ExternalOnlyTopologyRepair
+        $postLinkHdrState = Invoke-RepairStage -Label "Post-link HDR active preflight" -ScriptBlock { Get-HdrRuntimeState }
+        $postLinkExternalOnlyReady = Invoke-RepairStage -Label "Post-link external-only topology preflight" -ScriptBlock { Test-ExternalOnlyScreenTopologyReady }
+        if ($postLinkExternalOnlyReady) {
+            $externalOnlyReady = $true
+            $hdrText = if ($postLinkHdrState.HdrActive) { "HDR is already active" } else { "HDR still needs repair" }
+            Write-RepairLog "5K60 is enumerated after link refresh and external-only topology is already verified; $hdrText. Skipping the second external-only topology repair to avoid unnecessary display churn."
+        }
+        else {
+            Write-RepairLog "5K60 is now enumerated after link refresh. Re-running external-only topology repair before HDR."
+            $externalOnlyReady = Invoke-RepairStage -Label "External-only topology repair after link refresh" -ScriptBlock { Invoke-ExternalOnlyTopologyRepair }
+        }
     }
 
     $bootCampIdentityReadyForHdr = [bool](-not $bootCampIdentityState.ActiveMs0001 -or $bootCampIdentityState.BootCampStyleReady)
@@ -1318,7 +1607,7 @@ try {
     $shouldValidateBrightness = [bool]($postRefreshState.Has5K60Enumerated -or $postRefreshState.HasCurrent5K)
 
     if ($shouldRunHdrRepair) {
-        $hdrPreflightState = Get-HdrRuntimeState
+        $hdrPreflightState = Invoke-RepairStage -Label "HDR preflight" -ScriptBlock { Get-HdrRuntimeState }
         Write-RepairLog "HDR preflight: $(Format-HdrRuntimeState -State $hdrPreflightState)"
 
         if ($hdrPreflightState.HdrUnsupported) {
@@ -1326,24 +1615,47 @@ try {
             Write-AppleDisplayUsbProblemSummary
         }
 
-        $brightnessHidReadyBeforeRepair = Test-BrightnessHidReadyQuiet
+        $brightnessHidReadyBeforeRepair = Invoke-RepairStage -Label "Brightness HID preflight" -ScriptBlock { Test-BrightnessHidReadyQuiet }
         $needsAppleUsbRepair = [bool](-not $hdrPreflightState.HdrActive -or -not $brightnessHidReadyBeforeRepair)
+        $hdrStateAfterAppleUsbRepair = $hdrPreflightState
 
         if ($needsAppleUsbRepair) {
-            $appleUsbRepair = Invoke-AppleUsbInterfaceRepair
+            $appleUsbRepair = Invoke-RepairStage -Label "Apple USB/HID interface repair gate" -ScriptBlock { Invoke-AppleUsbInterfaceRepair }
             if ($appleUsbRepair.ExitCode -ne 0) {
                 Write-RepairLog "Apple USB/HID interface repair returned exit code $($appleUsbRepair.ExitCode). HDR will still be attempted when needed, but Windows may keep HighDynamicRangeSupported=False until the failed XDR USB control interface is fixed."
             }
+            $hdrStateAfterAppleUsbRepair = Invoke-RepairStage -Label "HDR preflight after Apple USB/HID repair" -ScriptBlock { Get-HdrRuntimeState }
+            Write-RepairLog "HDR state after Apple USB/HID repair: $(Format-HdrRuntimeState -State $hdrStateAfterAppleUsbRepair)"
         }
         else {
             Write-RepairLog "Apple USB/HID interface repair skipped because HDR is already active and brightness HID is readable."
         }
 
-        if ($hdrPreflightState.HdrActive) {
+        if ($hdrStateAfterAppleUsbRepair.HdrUnsupported -and -not $hdrStateAfterAppleUsbRepair.HdrActive) {
+            Write-RepairLog "HDR gate is still closed after Apple USB/HID repair. Running guarded HDR identity rollback once: test APPA/Generic PnP HDR-capable identity, then restore Boot Camp-style 5K60 fallback automatically if HDR does not open."
+            $identityRollback = Invoke-RepairStage -Label "HDR identity rollback gate" -ScriptBlock { Invoke-HdrIdentityRollbackRepair }
+            if ($identityRollback.ExitCode -ne 0) {
+                Write-RepairLog "HDR identity rollback returned exit code $($identityRollback.ExitCode). Continuing to final validation; success still requires ActiveColorMode=HDR."
+            }
+
+            $hdrStateAfterAppleUsbRepair = Invoke-RepairStage -Label "HDR preflight after identity rollback" -ScriptBlock { Get-HdrRuntimeState }
+            Write-RepairLog "HDR state after identity rollback: $(Format-HdrRuntimeState -State $hdrStateAfterAppleUsbRepair)"
+            $postIdentityResolutionState = Invoke-RepairStage -Label "Resolution probe after identity rollback" -ScriptBlock { Get-ResolutionLadderState }
+            Write-RepairLog "Resolution state after identity rollback: $($postIdentityResolutionState.Summary)"
+            if ($postIdentityResolutionState.HasCurrent5K -or $postIdentityResolutionState.Has5K60Enumerated) {
+                $postRefreshState = $postIdentityResolutionState
+            }
+        }
+
+        if ($hdrStateAfterAppleUsbRepair.HdrActive) {
             Write-RepairLog "HDR state repair skipped because HDR is already active."
         }
+        elseif ($hdrStateAfterAppleUsbRepair.HdrUnsupported) {
+            $hdrRepairFailed = $true
+            Write-RepairLog "HDR state repair skipped because Windows still reports HighDynamicRangeSupported=False after Apple USB/HID repair. SET_HDR_STATE cannot open this capability gate; final validation will keep exit code non-zero without spending another packet/diagnostic cycle."
+        }
         else {
-            $hdrRepair = Invoke-HdrRepair -RestoreWcgFallback:([bool]$hdrPreflightState.HdrUnsupported)
+            $hdrRepair = Invoke-RepairStage -Label "HDR state repair gate" -ScriptBlock { Invoke-HdrRepair -RestoreWcgFallback:([bool]$hdrStateAfterAppleUsbRepair.HdrUnsupported) }
             if ($hdrRepair.ExitCode -ne 0) {
                 $hdrRepairFailed = $true
                 Write-RepairLog "HDR state repair did not reach HDR mode. Exit code $($hdrRepair.ExitCode). If the log shows HighDynamicRangeSupported=False, this is the Windows/driver capability gate and not a brightness-service conflict."
@@ -1373,7 +1685,7 @@ catch {
 }
 finally {
     try {
-        Resume-BrightnessServicesAfterRepair -State $brightnessState
+        Invoke-RepairStage -Label "Resume brightness services" -ScriptBlock { Resume-BrightnessServicesAfterRepair -State $brightnessState } | Out-Null
     }
     catch {
         Write-RepairLog "Brightness service resume failed: $($_.Exception.Message)"
@@ -1381,7 +1693,7 @@ finally {
 
     try {
         if ($shouldValidateBrightness) {
-            $brightnessValidationOk = Invoke-BrightnessValidation
+            $brightnessValidationOk = Invoke-RepairStage -Label "Brightness HID final validation" -ScriptBlock { Invoke-BrightnessValidation }
             if (-not $brightnessValidationOk) {
                 $brightnessValidationFailed = $true
             }
@@ -1395,13 +1707,13 @@ finally {
     }
 }
 
-$finalState = Get-ResolutionLadderState
+$finalState = Invoke-RepairStage -Label "Final resolution state probe" -ScriptBlock { Get-ResolutionLadderState }
 Write-RepairLog "Final resolution state: $($finalState.Summary)"
 
 if ($exitCode -eq 0) {
     $finalHdrState = $null
     if (-not $SkipHdr) {
-        $finalHdrState = Get-HdrRuntimeState
+        $finalHdrState = Invoke-RepairStage -Label "Final HDR state probe" -ScriptBlock { Get-HdrRuntimeState }
         Write-RepairLog "Final HDR state: $(Format-HdrRuntimeState -State $finalHdrState)"
     }
 
@@ -1431,4 +1743,5 @@ else {
     Write-RepairLog "Integrated repair is exiting with prior failure code $exitCode. Final state was still recorded for diagnostics, but it will not be converted to success."
 }
 
+Write-RepairTimingSummary -FinalExitCode $exitCode
 exit $exitCode

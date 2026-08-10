@@ -41,6 +41,7 @@ $scriptFiles = @(
     "Remove-StudioDisplayLocalSigningCertificate.ps1",
     "Repair-StudioDisplayAppleUsbInterfaces.ps1",
     "Repair-StudioDisplayExternalMode.ps1",
+    "Repair-StudioDisplayHdrIdentityRollback.ps1",
     "Repair-StudioDisplayIntegrated.ps1",
     "Set-StudioDisplayHdrState.ps1",
     "Show-StudioDisplayRepairProgress.ps1",

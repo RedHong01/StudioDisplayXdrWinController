@@ -428,7 +428,7 @@ function Classify-LogLine {
         'Running HDR state repair' { $stage = "HdrStateRepair"; break }
         'SystemBrightnessMirror restart result|BrightnessKeyBridge restart result|brightness HID get' { $stage = "BrightnessRestore"; break }
         'Scheduled auto repair finished with exit code 0|code=0 final validation passed|Integrated repair finished successfully' { $stage = "CompleteCode0"; break }
-        'Scheduled auto repair finished with exit code [1-9]|Integrated repair finished with 5K60 enumerated, but HDR is still blocked' { $stage = "CompleteWithFailure"; break }
+        'Scheduled auto repair finished with exit code [1-9]|Integrated repair finished, but 5K60 is still not enumerated|Integrated repair finished with 5K60 enumerated, but HDR is still blocked' { $stage = "CompleteWithFailure"; break }
     }
 
     if ($Line -match 'Current mode:\s+5120x2880@60Hz.*Best enumerated mode:\s+1920x1080@60Hz|max=1920x1080@60Hz') {
@@ -490,7 +490,12 @@ function Write-Snapshot {
     if ($hdr -and $hdr.HdrUnsupported) {
         Add-Issue -Issue "HdrCapabilityGateClosed"
     }
-    if ($usb -and $usb.QueryOk -and $usb.FailedMi08Mi09Count -gt 0) {
+    if ($usb -and $usb.QueryOk -and $usb.FailedMi08Mi09Count -gt 0 -and (
+            (-not $hdr) -or
+            (-not $hdr.HdrActive) -or
+            $hdr.HdrUnsupported -or
+            ($resolution -and -not $resolution.FiveK60Enumerated)
+        )) {
         Add-Issue -Issue "AppleUsbMi08Mi09FailedStart"
     }
 
@@ -545,7 +550,7 @@ function Write-FinalSummary {
     $mirror = Get-ManagedPidState -FileName "SystemBrightnessMirror.pid"
     $bridge = Get-ManagedPidState -FileName "BrightnessKeyBridge.pid"
 
-    $knownConclusion = "The 2026-08-09 hot-plug chain ran through the Boot Camp-style path and recovered 5K60, but HDR remained blocked when VID_05AC&PID_1116 MI_08/MI_09 Apple USB control interfaces stayed at CM_PROB_FAILED_START."
+    $knownConclusion = "A hot-plug chain is actionable only after separating the gates: 5K60 mode-table recovery, HDR capability support, active HDR state, brightness HID readback, and VID_05AC&PID_1116 MI_08/MI_09 Apple USB control-interface health. MI_08/MI_09 failures are correlation evidence only when HDR/5K gates are still failing; they are not fatal after code=0."
     $possibleUserOverlap = [bool]($script:userOverlapCount -gt 0)
     $summary = [ordered]@{
         Version = 1
@@ -580,7 +585,9 @@ function Write-FinalSummary {
             "Treat desktop 5K with a 1080p/low enumerated mode table as degraded until 5K60 is enumerated.",
             "Treat WCG as not HDR; never record WCG as code=0.",
             "When Boot Camp-style MS_0001 is ready but HighDynamicRangeSupported=False, classify the active failure as an HDR capability gate, not brightness conflict.",
-            "If MI_08/MI_09 remain CM_PROB_FAILED_START after restart, back off repeated HDR packets and record the USB/reference-mode gate for the next reconnect.",
+            "If MI_08/MI_09 remain CM_PROB_FAILED_START while HDR is still inactive/unsupported, back off repeated HDR packets and record the USB/reference-mode gate for the next reconnect.",
+            "If MI_08/MI_09 remain failed but 5K60, HDR active, and brightness HID all validate, record them as non-fatal diagnostics instead of blocking code=0.",
+            "If current desktop is 5K but 5K60 is absent from the enumerated mode table, classify the round as a mode-table/link failure before blaming HDR.",
             "Only suspect user interference when input overlaps topology, USB4 router, Apple USB/HID, or HDR stages; never assert causality from input alone."
         )
     }

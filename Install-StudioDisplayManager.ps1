@@ -37,6 +37,8 @@ $brightnessInputTraceSource = Join-Path $sourceRoot "Trace-StudioDisplayBrightne
 $brightnessInputTraceTarget = Join-Path $installRoot "Trace-StudioDisplayBrightnessInput.ps1"
 $integratedRepairSource = Join-Path $sourceRoot "Repair-StudioDisplayIntegrated.ps1"
 $integratedRepairTarget = Join-Path $installRoot "Repair-StudioDisplayIntegrated.ps1"
+$hdrIdentityRollbackSource = Join-Path $sourceRoot "Repair-StudioDisplayHdrIdentityRollback.ps1"
+$hdrIdentityRollbackTarget = Join-Path $installRoot "Repair-StudioDisplayHdrIdentityRollback.ps1"
 $autoRepairSource = Join-Path $sourceRoot "Invoke-StudioDisplayAutoRepair.ps1"
 $autoRepairTarget = Join-Path $installRoot "Invoke-StudioDisplayAutoRepair.ps1"
 $hotplugAutomationTestSource = Join-Path $sourceRoot "Test-StudioDisplayHotplugAutomation.ps1"
@@ -63,12 +65,16 @@ $legacyManagerRunValueName = "Studio Display Manager"
 $legacyRunValueName = "Studio Display System Brightness Mirror"
 $startupTaskName = $appName
 $autoRepairTaskName = "$appName Auto Repair"
+$legacyRepairTaskNames = @(
+    "StudioDisplayHotPlugHdrRecovery"
+)
 $powershellExe = Join-Path $PSHOME "powershell.exe"
 $schtasksExe = Join-Path $env:SystemRoot "System32\schtasks.exe"
 $regExe = Join-Path $env:SystemRoot "System32\reg.exe"
 $runKeyRegPath = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 
 $managerPidFile = Join-Path $installRoot "StudioDisplayManager.pid"
+$managerLogPath = Join-Path $installRoot "SystemBrightnessMirror.log"
 $mirrorPidFile = Join-Path $installRoot "SystemBrightnessMirror.pid"
 $bridgePidFile = Join-Path $installRoot "BrightnessKeyBridge.pid"
 $legacyTrayPidFile = Join-Path $legacyInstallRoot "SystemBrightnessMirrorTray.pid"
@@ -76,8 +82,7 @@ $legacyManagerPidFile = Join-Path $legacyInstallRoot "StudioDisplayManager.pid"
 $legacyMirrorPidFile = Join-Path $legacyInstallRoot "SystemBrightnessMirror.pid"
 $legacyBridgePidFile = Join-Path $env:LOCALAPPDATA "StudioDisplayTools\BrightnessKeyBridge\BrightnessKeyBridge.pid"
 $obsoleteInstalledFiles = @(
-    "Repair-DiscordStudioDisplayMic.ps1",
-    "Repair-StudioDisplayHdrIdentityRollback.ps1"
+    "Repair-DiscordStudioDisplayMic.ps1"
 )
 
 function Stop-ExistingProcess {
@@ -93,6 +98,11 @@ function Stop-ExistingProcess {
         if ($process) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             Start-Sleep -Milliseconds 500
+            $stillRunning = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+            if ($stillRunning) {
+                Write-Warning "$appName could not stop existing process PID $($process.Id) from $PidPath; keeping the pid file so the starter can adopt the live singleton instead of launching a duplicate."
+                return
+            }
         }
     }
 
@@ -155,13 +165,13 @@ function Stop-OrphanStudioDisplayPowerShellProcesses {
 
 function Test-InstalledManagerRunning {
     if (-not (Test-Path -LiteralPath $managerPidFile)) {
-        return $false
+        return (Restore-InstalledManagerPidFileFromLog)
     }
 
     $managerPidText = Get-Content -LiteralPath $managerPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($managerPidText -notmatch '^\d+$') {
         Remove-Item -LiteralPath $managerPidFile -Force -ErrorAction SilentlyContinue
-        return $false
+        return (Restore-InstalledManagerPidFileFromLog)
     }
 
     $process = Get-Process -Id ([int]$managerPidText) -ErrorAction SilentlyContinue
@@ -170,6 +180,37 @@ function Test-InstalledManagerRunning {
     }
 
     Remove-Item -LiteralPath $managerPidFile -Force -ErrorAction SilentlyContinue
+    return (Restore-InstalledManagerPidFileFromLog)
+}
+
+function Restore-InstalledManagerPidFileFromLog {
+    if (-not (Test-Path -LiteralPath $managerLogPath)) {
+        return $false
+    }
+
+    try {
+        $candidateLines = @(Get-Content -LiteralPath $managerLogPath -Tail 400 -ErrorAction Stop)
+        [array]::Reverse($candidateLines)
+        foreach ($line in $candidateLines) {
+            if ($line -notmatch 'tray started with PID\s+(\d+)') {
+                continue
+            }
+
+            $candidatePid = [int]$Matches[1]
+            $process = Get-Process -Id $candidatePid -ErrorAction SilentlyContinue
+            if (-not $process) {
+                continue
+            }
+
+            Set-Content -LiteralPath $managerPidFile -Value ([string]$candidatePid) -Encoding ascii -ErrorAction Stop
+            Write-Host "$appName adopted existing tray process PID $candidatePid from log."
+            return $true
+        }
+    }
+    catch {
+        Write-Warning "$appName could not adopt an existing tray process from the log: $($_.Exception.Message)"
+    }
+
     return $false
 }
 
@@ -383,6 +424,23 @@ function Register-AutoRepairTask {
     }
 }
 
+function Remove-LegacyRepairTasks {
+    foreach ($taskName in $legacyRepairTaskNames) {
+        try {
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if (-not $task) {
+                continue
+            }
+
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+            Write-Host "$appName removed legacy scheduled repair task: $taskName"
+        }
+        catch {
+            Write-Warning "$appName could not remove legacy scheduled repair task '$taskName': $($_.Exception.Message)"
+        }
+    }
+}
+
 foreach ($pidPath in @($managerPidFile, $mirrorPidFile, $bridgePidFile, $legacyTrayPidFile, $legacyManagerPidFile, $legacyMirrorPidFile, $legacyBridgePidFile)) {
     Stop-ExistingProcess -PidPath $pidPath
 }
@@ -421,6 +479,7 @@ Copy-Item -LiteralPath $advancedColorSource -Destination $advancedColorTarget -F
 Copy-Item -LiteralPath $hdrStateSource -Destination $hdrStateTarget -Force
 Copy-Item -LiteralPath $brightnessInputTraceSource -Destination $brightnessInputTraceTarget -Force
 Copy-Item -LiteralPath $integratedRepairSource -Destination $integratedRepairTarget -Force
+Copy-Item -LiteralPath $hdrIdentityRollbackSource -Destination $hdrIdentityRollbackTarget -Force
 Copy-Item -LiteralPath $autoRepairSource -Destination $autoRepairTarget -Force
 Copy-Item -LiteralPath $hotplugAutomationTestSource -Destination $hotplugAutomationTestTarget -Force
 Copy-Item -LiteralPath $passiveHotplugObserverSource -Destination $passiveHotplugObserverTarget -Force
@@ -430,6 +489,7 @@ Copy-Item -LiteralPath $appleUsbInterfaceRepairSource -Destination $appleUsbInte
 Copy-Item -LiteralPath $mirrorSource -Destination $mirrorTarget -Force
 Copy-Item -LiteralPath $hidHelperSource -Destination $hidHelperTarget -Force
 
+Remove-LegacyRepairTasks
 Register-AutoRepairTask -AutoRepairPath $autoRepairTarget
 
 if (-not $SkipAutoStart) {

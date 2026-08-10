@@ -27,6 +27,53 @@ function Write-AutoRepairLog {
     Add-Content -LiteralPath $launcherLog -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
 }
 
+function Get-AutoRepairAppleUsbState {
+    $state = [ordered]@{
+        QueryOk = $false
+        Error = $null
+        DeviceCount = 0
+        FailedCount = 0
+        FailedMi08Mi09Count = 0
+        FailedMi08Mi09 = @()
+    }
+
+    try {
+        $devices = @(Get-PnpDevice -PresentOnly -ErrorAction Stop |
+            Where-Object { $_.InstanceId -match 'VID_05AC&PID_1116' } |
+            Select-Object Class, FriendlyName, Status, Problem, ConfigManagerErrorCode, InstanceId)
+
+        $failed = @($devices | Where-Object {
+            $statusNotOk = [bool]($_.Status -and $_.Status -ne "OK")
+            $problemText = [string]$_.Problem
+            $problemNotOk = [bool]($problemText -and $problemText -ne "CM_PROB_NONE")
+            $configText = [string]$_.ConfigManagerErrorCode
+            $configNotOk = [bool]($configText -and $configText -notin @("0", "CM_PROB_NONE"))
+            $statusNotOk -or $problemNotOk -or $configNotOk
+        })
+        $failedMi08Mi09 = @($failed | Where-Object { $_.InstanceId -match 'MI_08|MI_09' })
+
+        $state.QueryOk = $true
+        $state.DeviceCount = $devices.Count
+        $state.FailedCount = $failed.Count
+        $state.FailedMi08Mi09Count = $failedMi08Mi09.Count
+        $state.FailedMi08Mi09 = @($failedMi08Mi09 | ForEach-Object {
+            [pscustomobject]@{
+                Class = $_.Class
+                FriendlyName = $_.FriendlyName
+                Status = $_.Status
+                Problem = $_.Problem
+                ConfigManagerErrorCode = $_.ConfigManagerErrorCode
+                InstanceId = $_.InstanceId
+            }
+        })
+    }
+    catch {
+        $state.Error = $_.Exception.Message
+    }
+
+    return [pscustomobject]$state
+}
+
 function Test-AutoRepairCodeZeroState {
     $resolutionOutput = @()
     $hdrOutput = @()
@@ -80,6 +127,8 @@ function Test-AutoRepairCodeZeroState {
         $brightnessPercent = [int]$Matches[1]
     }
 
+    $appleUsbState = Get-AutoRepairAppleUsbState
+
     $ready = [bool](
         $resolutionExitCode -eq 0 -and
         $hasCurrent5K -and
@@ -92,7 +141,7 @@ function Test-AutoRepairCodeZeroState {
 
     return [pscustomobject]@{
         Ready = $ready
-        Detail = "resolutionExit=$resolutionExitCode,current5K=$hasCurrent5K,5K60Enumerated=$has5K60Enumerated,hdrExit=$hdrExitCode,hdrSupported=$hdrSupported,hdrActive=$hdrActive,brightnessExit=$brightnessExitCode,brightnessOk=$brightnessOk"
+        Detail = "resolutionExit=$resolutionExitCode,current5K=$hasCurrent5K,5K60Enumerated=$has5K60Enumerated,hdrExit=$hdrExitCode,hdrSupported=$hdrSupported,hdrActive=$hdrActive,brightnessExit=$brightnessExitCode,brightnessOk=$brightnessOk,appleUsbQueryOk=$($appleUsbState.QueryOk),appleUsbFailedMi08Mi09=$($appleUsbState.FailedMi08Mi09Count)"
         ResolutionExitCode = $resolutionExitCode
         Current5K = $hasCurrent5K
         FiveK60Enumerated = $has5K60Enumerated
@@ -102,6 +151,7 @@ function Test-AutoRepairCodeZeroState {
         BrightnessExitCode = $brightnessExitCode
         BrightnessOk = $brightnessOk
         BrightnessPercent = $brightnessPercent
+        AppleUsb = $appleUsbState
     }
 }
 
@@ -130,6 +180,7 @@ function Save-AutoRepairKnownGoodState {
             HdrActive = [bool]$State.HdrActive
             BrightnessOk = [bool]$State.BrightnessOk
             BrightnessPercent = $State.BrightnessPercent
+            AppleUsb = $State.AppleUsb
             ValidationDetail = $State.Detail
             SuccessRecipe = @(
                 "Detect active MS_0001 monitor identity inside integrated repair.",
@@ -138,7 +189,8 @@ function Save-AutoRepairKnownGoodState {
                 "Wait for the Boot Camp-style MS_0001 identity to settle before HDR, then retrain the Apple Studio Display XDR USB4 router when needed.",
                 "Require current 5120x2880 and an enumerated 5120x2880@60 mode table entry.",
                 "Require HighDynamicRangeSupported=True and ActiveColorMode=HDR or HighDynamicRangeUserEnabled=True.",
-                "Require Studio Display HID brightness readback before returning code=0."
+                "Require Studio Display HID brightness readback before returning code=0.",
+                "Record Apple USB MI_08/MI_09 failures for diagnostics, but do not block code=0 when 5K60, HDR active, and brightness HID all validate."
             )
         }
 
@@ -167,26 +219,39 @@ function Save-AutoRepairFailureState {
             $repairLogText = Get-Content -LiteralPath $RepairLog -Raw -ErrorAction SilentlyContinue
         }
 
-        $hdrGateBlocked = [bool](
-            $State.Current5K -and
-            $State.FiveK60Enumerated -and
+        $modeTableBlocked = [bool](-not $State.FiveK60Enumerated)
+        $hdrGateClosed = [bool](
             -not $State.HdrSupported -and
             -not $State.HdrActive
         )
+        $hdrGateBlocked = [bool](
+            $State.Current5K -and
+            $State.FiveK60Enumerated -and
+            $hdrGateClosed
+        )
         $appleUsbReferenceModeFailedStart = [bool](
-            $repairLogText -match 'CM_PROB_FAILED_START' -and
+            ($State.AppleUsb -and $State.AppleUsb.QueryOk -and [int]$State.AppleUsb.FailedMi08Mi09Count -gt 0) -or
             (
-                $repairLogText -match 'VID_05AC&PID_1116&MI_08' -or
-                $repairLogText -match 'VID_05AC&PID_1116&MI_09'
+                $repairLogText -match 'CM_PROB_FAILED_START' -and
+                (
+                    $repairLogText -match 'VID_05AC&PID_1116&MI_08' -or
+                    $repairLogText -match 'VID_05AC&PID_1116&MI_09'
+                )
             )
         )
-        $classification = if ($hdrGateBlocked -and $appleUsbReferenceModeFailedStart) {
+        $classification = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {
+            "ResolutionModeTableAndHdrGateBlockedWithAppleUsbReferenceModeFailedStart"
+        }
+        elseif ($modeTableBlocked -and $hdrGateClosed) {
+            "ResolutionModeTableAndHdrGateBlocked"
+        }
+        elseif ($hdrGateBlocked -and $appleUsbReferenceModeFailedStart) {
             "HdrGateBlockedWithAppleUsbReferenceModeFailedStart"
         }
         elseif ($hdrGateBlocked) {
             "HdrGateBlockedWithStable5K60"
         }
-        elseif (-not $State.FiveK60Enumerated) {
+        elseif ($modeTableBlocked) {
             "ResolutionModeTableBlocked"
         }
         elseif (-not $State.BrightnessOk) {
@@ -209,9 +274,16 @@ function Save-AutoRepairFailureState {
             HdrActive = [bool]$State.HdrActive
             BrightnessOk = [bool]$State.BrightnessOk
             BrightnessPercent = $State.BrightnessPercent
+            AppleUsb = $State.AppleUsb
             AppleUsbReferenceModeFailedStart = $appleUsbReferenceModeFailedStart
             ValidationDetail = $State.Detail
-            NextAction = if ($appleUsbReferenceModeFailedStart) {
+            NextAction = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {
+                "Do not keep sending HDR packets against this state. Preserve the current visible desktop, then use a fresh Boot Camp-style USB4/router re-enumeration on the next physical reconnect or controlled repair round; verify 5K60 mode table first, then HDR."
+            }
+            elseif ($modeTableBlocked -and $hdrGateClosed) {
+                "Treat this as a mode-table/link identity failure before HDR. Rebuild Boot Camp-style identity and USB4 link, then re-check HDR only after 5K60 is enumerated."
+            }
+            elseif ($appleUsbReferenceModeFailedStart) {
                 "Stop repeating HDR packets. Keep 5K60 and brightness, back off deep repair, and wait for a fresh Thunderbolt/USB4 physical re-enumeration or power-resume event before retrying."
             }
             elseif ($hdrGateBlocked) {

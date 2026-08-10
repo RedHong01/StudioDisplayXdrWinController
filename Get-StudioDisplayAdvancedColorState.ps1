@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [switch]$IncludeDxDiag,
-    [switch]$SkipDxDiagFallback
+    [switch]$SkipDxDiagFallback,
+    [ValidateRange(5, 120)]
+    [int]$DxDiagTimeoutSeconds = 25
 )
 
 $ErrorActionPreference = "Stop"
@@ -204,56 +206,71 @@ function Get-DxDiagDisplaySummary {
     }
 
     $outputPath = Join-Path $env:TEMP ("StudioDisplayDxDiag-{0}.txt" -f ([Guid]::NewGuid().ToString("N")))
-    Start-Process -FilePath $dxdiag -ArgumentList @("/whql:off", "/t", $outputPath) -Wait -WindowStyle Hidden
-    if (-not (Test-Path -LiteralPath $outputPath)) {
-        return $null
-    }
-
-    $sections = New-Object System.Collections.Generic.List[object]
-    $current = $null
-    foreach ($line in Get-Content -LiteralPath $outputPath) {
-        if ($line -match '^\s*Card name:\s*(.+)$') {
-            if ($current) {
-                $sections.Add([pscustomobject]$current) | Out-Null
+    try {
+        $process = Start-Process -FilePath $dxdiag -ArgumentList @("/whql:off", "/t", $outputPath) -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit($DxDiagTimeoutSeconds * 1000)) {
+            Write-Warning "dxdiag did not finish within $DxDiagTimeoutSeconds seconds; skipping dxdiag fallback so HDR repair cannot hang on diagnostics."
+            try {
+                $process.Kill()
+            }
+            catch {
+                Write-Warning "Could not stop timed-out dxdiag process $($process.Id): $($_.Exception.Message)"
             }
 
-            $current = [ordered]@{
-                CardName = $Matches[1].Trim()
+            return $null
+        }
+
+        if (-not (Test-Path -LiteralPath $outputPath)) {
+            return $null
+        }
+
+        $sections = New-Object System.Collections.Generic.List[object]
+        $current = $null
+        foreach ($line in Get-Content -LiteralPath $outputPath) {
+            if ($line -match '^\s*Card name:\s*(.+)$') {
+                if ($current) {
+                    $sections.Add([pscustomobject]$current) | Out-Null
+                }
+
+                $current = [ordered]@{
+                    CardName = $Matches[1].Trim()
+                }
+                continue
             }
-            continue
+
+            if (-not $current) {
+                continue
+            }
+
+            if ($line -match '^\s*Current Mode:\s*(.+)$') { $current.CurrentMode = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*HDR Support:\s*(.+)$') { $current.HdrSupport = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Display Color Space:\s*(.+)$') { $current.DisplayColorSpace = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Display Luminance:\s*(.+)$') { $current.DisplayLuminance = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Monitor Name:\s*(.+)$') { $current.MonitorName = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Monitor Model:\s*(.+)$') { $current.MonitorModel = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Monitor Id:\s*(.+)$') { $current.MonitorId = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Native Mode:\s*(.+)$') { $current.NativeMode = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Output Type:\s*(.+)$') { $current.OutputType = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Monitor Capabilities:\s*(.+)$') { $current.MonitorCapabilities = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Advanced Color:\s*(.+)$') { $current.AdvancedColor = $Matches[1].Trim(); continue }
+            if ($line -match '^\s*Active Color Mode:\s*(.+)$') { $current.ActiveColorMode = $Matches[1].Trim(); continue }
         }
 
-        if (-not $current) {
-            continue
+        if ($current) {
+            $sections.Add([pscustomobject]$current) | Out-Null
         }
 
-        if ($line -match '^\s*Current Mode:\s*(.+)$') { $current.CurrentMode = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*HDR Support:\s*(.+)$') { $current.HdrSupport = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Display Color Space:\s*(.+)$') { $current.DisplayColorSpace = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Display Luminance:\s*(.+)$') { $current.DisplayLuminance = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Monitor Name:\s*(.+)$') { $current.MonitorName = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Monitor Model:\s*(.+)$') { $current.MonitorModel = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Monitor Id:\s*(.+)$') { $current.MonitorId = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Native Mode:\s*(.+)$') { $current.NativeMode = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Output Type:\s*(.+)$') { $current.OutputType = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Monitor Capabilities:\s*(.+)$') { $current.MonitorCapabilities = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Advanced Color:\s*(.+)$') { $current.AdvancedColor = $Matches[1].Trim(); continue }
-        if ($line -match '^\s*Active Color Mode:\s*(.+)$') { $current.ActiveColorMode = $Matches[1].Trim(); continue }
+        return @($sections |
+            Where-Object {
+                $_.MonitorId -match '^(APPA|MS_)' -or
+                $_.MonitorModel -match 'StudioDisplay|Studio Display|Display XDR' -or
+                $_.CurrentMode -match '5120 x 2880'
+            } |
+            Select-Object -First 1)
     }
-
-    if ($current) {
-        $sections.Add([pscustomobject]$current) | Out-Null
+    finally {
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
     }
-
-    Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
-
-    return @($sections |
-        Where-Object {
-            $_.MonitorId -match '^(APPA|MS_)' -or
-            $_.MonitorModel -match 'StudioDisplay|Studio Display|Display XDR' -or
-            $_.CurrentMode -match '5120 x 2880'
-        } |
-        Select-Object -First 1)
 }
 
 $pathCount = 0
