@@ -748,7 +748,7 @@ function Test-ActiveHdrMode {
     try {
         $probe = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $advancedColorProbeScript -IncludeDxDiag 2>$null)
         $probeText = $probe -join "`n"
-        return [bool]($probeText -match 'ActiveColorMode\s*:\s*DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR')
+        return [bool]($probeText -match '(?m)^[^\S\r\n]*ActiveColorMode[^\S\r\n]*:[^\S\r\n]*DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR[^\S\r\n]*$')
     }
     catch {
         Write-Warning "HDR preservation probe failed: $($_.Exception.Message)"

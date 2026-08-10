@@ -2,6 +2,165 @@
 
 ## Unreleased
 
+- Recovered brightness worker lifecycle management from stale/no-pid mutex
+  states. The tray and integrated repair can now adopt uniquely identifiable
+  `SystemBrightnessMirror`/`BrightnessKeyBridge` workers, avoid duplicate
+  launches when only a mutex is visible, and reclaim orphaned workers during a
+  brightness restart or full 5K/HDR repair transaction.
+- Added a hot-plug automation verification tool. `Test-StudioDisplayHotplugAutomation.ps1`
+  audits the tray workers, scheduled elevated repair task, Boot Camp-style
+  `code=0` recipe, HDR/5K/brightness gates, and can optionally run the scheduled
+  task after the launcher preflights and skips disruptive repair when already
+  healthy.
+- Added a passive hot-plug observer. The tray now starts
+  `Watch-StudioDisplayHotplugAutomation.ps1` on reconnect, startup, resume, and
+  topology-change events; it records stage/decision snapshots, 5K mode-table
+  state, HDR gate state, Apple `VID_05AC&PID_1116` `MI_08`/`MI_09` failed-start
+  evidence, brightness worker state, and user-input overlap as correlation-only
+  data without intervening in the display pipeline.
+- Clamped the HDR-gate retry counter when persisting/restoring backoff state, so
+  logs no longer report impossible counts such as `3/2` after a transient 5K
+  mode-table repair re-enters the same HDR capability-gate failure.
+- Added a post-link Boot Camp-style mode-table rebind. If hot-plug starts before
+  active `MS_0001` exists, the integrated repair no longer misses the monitor-INF
+  refresh opportunity; once `MS_0001` becomes active and is bound to the custom
+  Boot Camp-style INF but Windows still exposes only a low-resolution mode table,
+  the repair performs one controlled INF rebind and USB4/monitor refresh before
+  giving up on 5K60 enumeration.
+- When the manual progress window's `Space` fallback is used, the tray now treats
+  that as an explicit temporary-visible state. The main repair entry is relabeled
+  to rebuild from fallback back into the Boot Camp-style `5120x2880@60` HDR
+  pipeline, and the fallback marker is cleared only after final 5K60/HDR/brightness
+  probes pass.
+- Retargeted XDR link refresh and external-only repair to the stable
+  Boot Camp-style `5120x2880@60` HDR pipeline. `5120x2880@120` remains a
+  diagnostic probe, but its absence no longer becomes the deciding target for the
+  public repair transaction.
+- The integrated repair now rebuilds the Boot Camp-style monitor-INF transaction
+  when active `MS_0001` is already bound to the custom INF but Windows still
+  exposes no enumerated 5K60 mode table. This targets the "desktop is 5K but
+  games still see 1080p/3K" half-restored state directly.
+- Collapsed the default hot-plug HDR strategy onto a single Boot Camp-style
+  `MS_0001` pipeline. Generic/Digital Flat Panel fallback is now treated as
+  diagnostic-only for HDR, while active `MS_0001` sessions must bind to this
+  project's Boot Camp-style `oem*.inf` with HDR EDID metadata before HDR packets
+  are sent.
+- Added a Boot Camp-style identity settle gate before HDR repair. This prevents
+  the faster Microsoft `monitor.inf` fallback from winning the hot-plug race and
+  leaving Windows at stable 5K60 but `HighDynamicRangeSupported=False`.
+- Removed the HDR identity rollback experiment from the installed controller
+  and release package. It remains source-tree diagnostic material only, so the
+  shipped tool exposes one working recovery pipeline instead of two competing
+  monitor-identity strategies.
+- Added manual repair audio feedback and a Space-key escape hatch. While the
+  Boot Camp-style identity is being rebuilt, the progress window plays periodic
+  system sounds; pressing Space stops the full HDR wait and applies a quick
+  visible external fallback that can later be replaced by the tray's
+  Boot Camp-style 5K60 HDR rebuild.
+- Persisted the known-good `code=0` recovery baseline from the auto-repair
+  launcher. When final independent probes confirm current 5K, enumerated 5K60,
+  HDR supported/active, and readable Studio Display HID brightness, the
+  installed controller now writes `StudioDisplayKnownGoodState.json` with the
+  exact recovery recipe so future hot-plug debugging and automation use the same
+  success gates instead of relying only on transient logs.
+- Persisted `StudioDisplayLastFailureState.json` when automatic repair does not
+  reach `code=0`. Stable 5K60 plus `HighDynamicRangeSupported=False` is now
+  classified separately, and logs that still show Apple `VID_05AC&PID_1116`
+  `MI_08`/`MI_09` failed-start interfaces are tagged as a reference-mode USB
+  gate instead of causing blind repeated HDR packet attempts.
+- Fixed the Boot Camp-style fallback preflight so `monitor.inf` entries under
+  `pnputil`'s `Matching Drivers` list no longer count as the active binding when
+  the current `Driver Name` is this project's installed `oem*.inf`. This
+  prevents a stable 5K `MS_0001` session with full HDR EDID metadata from
+  re-running the monitor-INF transaction.
+- Stopped default integrated repair from automatically enabling WCG fallback
+  when the HDR gate is closed. WCG remains available only through explicit
+  `-AllowWcgFallback` diagnostics, so a failed HDR recovery cannot silently
+  convert the session into WCG and then be mistaken for HDR.
+- Reconnected the Boot Camp-style monitor fallback to the unified repair
+  pipeline. If the active `MS_0001` display falls back to Microsoft
+  `monitor.inf`, loses the generated monitor driver package, or exposes only a
+  128-byte EDID without HDR static metadata, the integrated repair now
+  automatically reinstalls the signed monitor INF before USB4 retraining,
+  5K60 validation, HDR activation, and brightness validation. The tray also
+  bypasses the 5K mode-table backoff for this specific missing-driver state so
+  hot-plug automation can recover instead of waiting forever on a stale
+  1080p/HDR-gate failure.
+- Kept the Boot Camp-style monitor installer from reporting failure when its
+  post-install native-mode guard runs before USB4 retraining has refreshed the
+  Windows mode table. The installer now logs that transient guard failure as a
+  warning and leaves final 5K/HDR validation to the integrated pipeline.
+- Added controlled HDR identity rollback tooling for the `MS_0001` monitor path.
+  The new script removes only this project's Boot Camp-style monitor INF
+  packages, lets Windows rebind through `monitor.inf`, verifies 5K60/HDR, and
+  restores the 5K60 fallback if resolution regresses.
+- Tightened auto-repair success semantics: the launcher now refuses `code=0`
+  unless final independent probes confirm 5K60 current/enumerated, HDR supported
+  and active, and Studio Display HID brightness readable. WCG fallback is logged
+  as WCG, not HDR. The launcher also has a `-ValidateOnly` mode for
+  non-disruptive final-state checks.
+- Hardened resolution/HDR output parsing to single-line anchored matches so
+  multi-line PowerShell output cannot accidentally satisfy the HDR gate.
+- Stopped the default HDR-gate recovery path from switching strategies after a
+  Boot Camp-style failure. Historical logs now show Generic/Digital Flat Panel
+  can preserve 5K60 while still leaving `HighDynamicRangeSupported=False`; the
+  default path therefore keeps the Boot Camp-style `MS_0001` identity as the
+  single HDR pipeline and records/backoffs gate failures instead of alternating
+  between competing monitor identities.
+- Fixed automatic hot-plug repair getting stuck in repeated HDR-gate retries
+  after 5K60 was already restored. The tray now classifies stable 5K60 plus
+  `HighDynamicRangeSupported=False` as an HDR capability-gate block, backs off
+  instead of looping deep USB4/HDR repair, and clears that block on fresh
+  Thunderbolt reconnect, power resume, or a successful HDR probe. The backoff
+  is persisted locally so restarting/reinstalling the tray does not immediately
+  repeat the same failed HDR-gate transaction.
+- Coalesced topology/lid-state events that arrive while the elevated integrated
+  auto-repair task is already running. The controller now attaches to the
+  current transaction instead of resetting `integratedRepairInFlight`, launching
+  another topology pass, or submitting another scheduled-task run.
+- Removed the remaining split-pipeline tray and hot-plug paths. Direct
+  external-only/link-refresh tray buttons are gone, and reconnect/resume/topology
+  events now queue the integrated topology/5K/HDR/brightness transaction instead
+  of running a standalone topology repair first.
+- Removed the Discord microphone helper from the public controller, installer,
+  and release list. App-specific helpers stay out of the open-source package;
+  game/display issues are documented through generic diagnostics instead.
+- Simplified the tray menu information architecture. The primary menu now keeps
+  the daily one-click repair visible while grouping brightness service controls,
+  HDR/brightness context, permission repair, logs, and diagnostics into focused
+  submenus.
+- Fixed installer handling for the elevated hot-plug auto-repair task. The
+  installer now verifies an existing task before registering, automatically
+  launches a UAC registrar when a non-elevated install needs to create or repair
+  the task, waits for completion, and validates success through Task Scheduler
+  or the registrar log instead of emitting a misleading warning every install.
+- Added one-click repair preflight and skip logic. The tray now skips the full
+  repair when 5K60, HDR active, brightness workers, and hardware brightness HID
+  are already healthy; it only restarts brightness workers when that is the sole
+  missing piece; and it asks for UAC immediately before a deep USB4/HDR/HID
+  repair is required.
+- Extended the same stable-5K60 skip guard to tray startup and hot-plug
+  topology repair, so reconnect/startup does not bounce through the 2K safety
+  stage when the Studio Display is already the only active 5K60 screen.
+- Hardened the progress and integrated repair scripts. The progress window now
+  follows the actual repair child process instead of waiting forever for a
+  missing final log line, and the integrated repair skips already-satisfied
+  external-only/5K/HDR stages to avoid unnecessary black screens.
+- Fixed brightness worker false positives caused by orphan mutex holders. The
+  brightness mirror and key bridge now return a non-zero duplicate-instance
+  exit code, and the tray logs worker startup failures with exit code, pid-file,
+  and mutex state so stale hidden workers can be diagnosed instead of silently
+  blocking mouse brightness keys.
+- Added a 5K mode-table backoff for degraded Thunderbolt sessions. If the
+  elevated repair finishes while Windows still exposes only a non-5K/1080p mode
+  table, the tray now records a local block state and waits for a fresh
+  reconnect, power resume, or successful 5K probe instead of repeatedly
+  restarting the Apple USB4 router every repair cycle.
+- Hardened brightness worker adoption and installer cleanup. The tray now
+  treats an existing mutex owner as an already-running brightness worker instead
+  of spawning duplicates, and the installer attempts to stop orphaned
+  controller-owned PowerShell workers even when their pid files are missing.
+
 ## 0.1.12 - 2026-08-07
 
 - Renamed the public app/package branding to `Studio Display XDR Win
@@ -94,9 +253,10 @@
 - Hardened integrated HDR repair so it requires an enumerated Studio Display
   5K60 mode table before writing HDR state, avoiding WCG-only fallback when the
   desktop is 5K but Windows still exposes only a low-resolution mode list.
-- Changed default unified repair so it no longer refreshes the Boot Camp-style
-  monitor fallback driver unless explicitly requested, preventing hot-plug
-  repair from pinning a recovered Apple/XDR path back to `MS_0001`.
+- Replaced the earlier "do not refresh Boot Camp-style by default" experiment
+  with the current single-pipeline rule: active `MS_0001` repair must converge
+  on the Boot Camp-style monitor identity before HDR, while Generic/Digital
+  Flat Panel fallback remains diagnostic-only.
 - Changed external-mode repair so `CDS_TEST`-accepted 5K modes are diagnostic
   only by default. `5120x2880@60` must be in the enumerated mode table before
   HDR and game-mode-list repair can be treated as successful.

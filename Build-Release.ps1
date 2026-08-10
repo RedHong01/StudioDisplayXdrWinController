@@ -39,7 +39,6 @@ $scriptFiles = @(
     "Refresh-StudioDisplayXdrLink.ps1",
     "Remove-StudioDisplayLegacyTools.ps1",
     "Remove-StudioDisplayLocalSigningCertificate.ps1",
-    "Repair-DiscordStudioDisplayMic.ps1",
     "Repair-StudioDisplayAppleUsbInterfaces.ps1",
     "Repair-StudioDisplayExternalMode.ps1",
     "Repair-StudioDisplayIntegrated.ps1",
@@ -52,8 +51,10 @@ $scriptFiles = @(
     "StudioDisplayHid.ps1",
     "StudioDisplayManager.ps1",
     "SystemBrightnessMirror.ps1",
+    "Test-StudioDisplayHotplugAutomation.ps1",
     "Test-StudioDisplayResolutionLadder.ps1",
-    "Trace-StudioDisplayBrightnessInput.ps1"
+    "Trace-StudioDisplayBrightnessInput.ps1",
+    "Watch-StudioDisplayHotplugAutomation.ps1"
 )
 
 $excludedReleaseDocs = @(

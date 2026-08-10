@@ -277,14 +277,26 @@ function Get-AdvancedColorPreflight {
     }
 
     $text = ($probe -join "`n")
-    $hdrSupportedTrue = ($text -match 'HighDynamicRangeSupported\s*:\s*True' -or $text -match 'HdrSupport\s*:\s*(Supported|HDR Supported)')
-    $hdrSupportedFalse = ($text -match 'HighDynamicRangeSupported\s*:\s*False' -or $text -match 'HdrSupport\s*:\s*Not Supported')
+    $hdrSupportedTrue = (
+        $text -match '(?m)^[^\S\r\n]*HighDynamicRangeSupported[^\S\r\n]*:[^\S\r\n]*True[^\S\r\n]*$' -or
+        $text -match '(?m)^[^\S\r\n]*HdrSupport[^\S\r\n]*:[^\S\r\n]*(Supported|HDR Supported)[^\S\r\n]*$'
+    )
+    $hdrSupportedFalse = (
+        $text -match '(?m)^[^\S\r\n]*HighDynamicRangeSupported[^\S\r\n]*:[^\S\r\n]*False[^\S\r\n]*$' -or
+        $text -match '(?m)^[^\S\r\n]*HdrSupport[^\S\r\n]*:[^\S\r\n]*Not Supported[^\S\r\n]*$'
+    )
     return [pscustomobject]@{
         Output = $probe
         HdrSupportKnown = [bool]($hdrSupportedTrue -or $hdrSupportedFalse)
         HdrSupported = [bool]$hdrSupportedTrue
-        HdrActive = [bool]($text -match 'ActiveColorMode\s*:\s*DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR' -or $text -match 'HighDynamicRangeUserEnabled\s*:\s*True')
-        WcgActive = [bool]($text -match 'ActiveColorMode\s*:\s*DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG' -or $text -match 'WideColorUserEnabled\s*:\s*True')
+        HdrActive = [bool](
+            $text -match '(?m)^[^\S\r\n]*ActiveColorMode[^\S\r\n]*:[^\S\r\n]*DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR[^\S\r\n]*$' -or
+            $text -match '(?m)^[^\S\r\n]*HighDynamicRangeUserEnabled[^\S\r\n]*:[^\S\r\n]*True[^\S\r\n]*$'
+        )
+        WcgActive = [bool](
+            $text -match '(?m)^[^\S\r\n]*ActiveColorMode[^\S\r\n]*:[^\S\r\n]*DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG[^\S\r\n]*$' -or
+            $text -match '(?m)^[^\S\r\n]*WideColorUserEnabled[^\S\r\n]*:[^\S\r\n]*True[^\S\r\n]*$'
+        )
     }
 }
 
@@ -391,14 +403,14 @@ if (-not $SkipVerification) {
         $verification
 
         $verificationText = $verification -join "`n"
-        if ($desiredState -and $verificationText -match 'ActiveColorMode\s*:\s*DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG') {
+        if ($desiredState -and $verificationText -match '(?m)^[^\S\r\n]*ActiveColorMode[^\S\r\n]*:[^\S\r\n]*DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG[^\S\r\n]*$') {
             Write-Warning "Verification shows WCG active color mode, not HDR. The display path is advanced-color enabled, but Windows did not enter HDR mode."
             if ($exitCode -eq 0) {
                 $exitCode = 3
             }
         }
 
-        if ($desiredState -and $verificationText -match 'HighDynamicRangeSupported\s*:\s*False') {
+        if ($desiredState -and $verificationText -match '(?m)^[^\S\r\n]*HighDynamicRangeSupported[^\S\r\n]*:[^\S\r\n]*False[^\S\r\n]*$') {
             Write-Warning "Verification shows HighDynamicRangeSupported=False. Windows will not accept SET_HDR_STATE until the active monitor path is re-enumerated as HDR-capable."
             if ($exitCode -eq 0) {
                 $exitCode = 4

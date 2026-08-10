@@ -340,7 +340,7 @@ function New-MonitorInfContent {
     $lines.Add("Class=Monitor") | Out-Null
     $lines.Add("ClassGuid={4D36E96E-E325-11CE-BFC1-08002BE10318}") | Out-Null
     $lines.Add("Provider=%ProviderName%") | Out-Null
-    $lines.Add("DriverVer=$today,0.1.2.0") | Out-Null
+    $lines.Add("DriverVer=$today,0.1.3.0") | Out-Null
     if (-not [string]::IsNullOrWhiteSpace($CatalogFileName)) {
         $lines.Add("CatalogFile=$CatalogFileName") | Out-Null
     }
@@ -530,8 +530,19 @@ function Invoke-MonitorDriverInstall {
     }
 
     if (Test-Path -LiteralPath $repairScript) {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $repairScript -Topology External -SkipSafetyMode 2>&1 |
-            ForEach-Object { Write-InstallLog ([string]$_) }
+        $repairOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $repairScript `
+            -Topology External `
+            -ExpectedWidth 5120 `
+            -ExpectedHeight 2880 `
+            -ExpectedRefreshRate 60 `
+            -RefreshRate 60 `
+            -SkipSafetyMode `
+            -PreserveActiveHdr 2>&1
+        $repairExitCode = $LASTEXITCODE
+        $repairOutput | ForEach-Object { Write-InstallLog ([string]$_) }
+        if ($repairExitCode -ne 0) {
+            Write-InstallLog "Post-install 5K60 mode guard returned exit code $repairExitCode. The monitor INF install succeeded; the integrated repair will continue with USB4/monitor retraining before final 5K/HDR validation."
+        }
     }
 }
 

@@ -20,6 +20,9 @@ drivers/
 # Local runtime state
 backups/*
 !backups/.gitkeep
+StudioDisplayKnownGoodState.json
+StudioDisplayLastFailureState.json
+StudioDisplayFastVisibleFallbackState.json
 
 # Machine-local game or chat-app experiments
 local-tools/

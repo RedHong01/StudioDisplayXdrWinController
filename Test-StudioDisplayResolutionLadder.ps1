@@ -2,7 +2,10 @@
 param(
     [string]$DeviceName,
     [string]$ReportPath,
-    [switch]$ApplyFirstPassingMode
+    [switch]$ApplyFirstPassingMode,
+    [int]$ApplyWidth,
+    [int]$ApplyHeight,
+    [int]$ApplyRefreshRate
 )
 
 $ErrorActionPreference = "Stop"
@@ -229,6 +232,10 @@ $ladder = @(
 $currentMode = Get-CurrentDisplayMode -TargetDeviceName $DeviceName
 $availableModes = @(Get-AvailableDisplayModes -TargetDeviceName $DeviceName)
 $firstPassingModeApplied = $false
+$applySpecificMode = [bool]($ApplyWidth -or $ApplyHeight -or $ApplyRefreshRate)
+if ($applySpecificMode -and -not ($ApplyWidth -and $ApplyHeight -and $ApplyRefreshRate)) {
+    throw "ApplyWidth, ApplyHeight, and ApplyRefreshRate must be provided together."
+}
 
 $results = foreach ($candidate in $ladder) {
     $enumerated = [bool]($availableModes |
@@ -240,8 +247,13 @@ $results = foreach ($candidate in $ladder) {
         Select-Object -First 1)
 
     $shouldApply = (
-        $ApplyFirstPassingMode -and
-        -not $firstPassingModeApplied
+        ($ApplyFirstPassingMode -and -not $firstPassingModeApplied) -or
+        (
+            $applySpecificMode -and
+            $candidate.Width -eq $ApplyWidth -and
+            $candidate.Height -eq $ApplyHeight -and
+            $candidate.RefreshRate -eq $ApplyRefreshRate
+        )
     )
 
     $test = Test-DisplayMode `

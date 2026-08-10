@@ -428,6 +428,10 @@ function Invoke-NativeModeRepair {
         "-ExecutionPolicy", "Bypass",
         "-File", $repairScript,
         "-Topology", "External",
+        "-ExpectedWidth", "5120",
+        "-ExpectedHeight", "2880",
+        "-ExpectedRefreshRate", "60",
+        "-RefreshRate", "60",
         "-SkipSafetyMode",
         "-RequireExternalOnly",
         "-PreserveActiveHdr"
@@ -498,6 +502,6 @@ if (Test-Studio5KModeEnumerated) {
     exit 0
 }
 
-Write-RefreshLog "Studio Display XDR native 5120x2880@120 is still missing. Current state: $(Get-CurrentModeSummary)"
-Write-RefreshLog "Next step: use -RestartAppleUsb4Router, reconnect the display on a direct Thunderbolt 5/USB4 port, or power-cycle the display to force a USB4/EDID retrain."
+Write-RefreshLog "Boot Camp-style 5120x2880@60 mode is still missing from the Windows mode table. Current state: $(Get-CurrentModeSummary)"
+Write-RefreshLog "Next step: use -RestartAppleUsb4Router, reconnect the display on a direct Thunderbolt 5/USB4 port, or power-cycle the display to force a USB4/EDID retrain. 5120x2880@120 remains diagnostic-only and is not required for the stable HDR pipeline."
 exit 2

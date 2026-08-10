@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Reason = "scheduled hot-plug HDR repair"
+    [string]$Reason = "scheduled hot-plug HDR repair",
+    [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = "Continue"
@@ -8,8 +9,13 @@ $ErrorActionPreference = "Continue"
 $scriptRoot = $PSScriptRoot
 $reportsRoot = Join-Path $scriptRoot "reports"
 $integratedRepairScript = Join-Path $scriptRoot "Repair-StudioDisplayIntegrated.ps1"
+$resolutionLadderScript = Join-Path $scriptRoot "Test-StudioDisplayResolutionLadder.ps1"
+$advancedColorScript = Join-Path $scriptRoot "Get-StudioDisplayAdvancedColorState.ps1"
+$brightnessHidScript = Join-Path $scriptRoot "StudioDisplayHid.ps1"
 $logPath = Join-Path $reportsRoot ("StudioDisplayAutoIntegratedRepair-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 $launcherLog = Join-Path $reportsRoot "StudioDisplayAutoRepairTask.log"
+$knownGoodStateFile = Join-Path $scriptRoot "StudioDisplayKnownGoodState.json"
+$lastFailureStateFile = Join-Path $scriptRoot "StudioDisplayLastFailureState.json"
 $powershellExe = Join-Path $PSHOME "powershell.exe"
 
 New-Item -ItemType Directory -Force -Path $reportsRoot -ErrorAction SilentlyContinue | Out-Null
@@ -21,6 +27,270 @@ function Write-AutoRepairLog {
     Add-Content -LiteralPath $launcherLog -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
 }
 
+function Test-AutoRepairCodeZeroState {
+    $resolutionOutput = @()
+    $hdrOutput = @()
+    $brightnessOutput = @()
+
+    if (-not (Test-Path -LiteralPath $resolutionLadderScript)) {
+        return [pscustomobject]@{
+            Ready = $false
+            Detail = "resolution ladder script missing"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $advancedColorScript)) {
+        return [pscustomobject]@{
+            Ready = $false
+            Detail = "advanced color script missing"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $brightnessHidScript)) {
+        return [pscustomobject]@{
+            Ready = $false
+            Detail = "brightness HID script missing"
+        }
+    }
+
+    $resolutionOutput = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $resolutionLadderScript 2>&1)
+    $resolutionExitCode = $LASTEXITCODE
+    $resolutionText = ($resolutionOutput -join "`n")
+    $hasCurrent5K = [bool]($resolutionText -match '(?m)^Current mode:[^\S\r\n]+5120x2880@')
+    $has5K60Enumerated = [bool](
+        $resolutionText -match '(?m)^5K 60Hz legacy Studio Display fallback[^\r\n]*[^\S\r\n]+5120[^\S\r\n]+2880[^\S\r\n]+60[^\S\r\n]+True(?:[^\S\r\n]|$)' -or
+        $resolutionText -match '(?m)^Best enumerated mode:[^\S\r\n]+5120x2880@60Hz[^\S\r\n]*$'
+    )
+
+    $hdrOutput = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $advancedColorScript -SkipDxDiagFallback 2>&1)
+    $hdrExitCode = $LASTEXITCODE
+    $hdrText = ($hdrOutput -join "`n")
+    $hdrActive = [bool](
+        $hdrText -match '(?m)^[^\S\r\n]*ActiveColorMode[^\S\r\n]*:[^\S\r\n]*DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR[^\S\r\n]*$' -or
+        $hdrText -match '(?m)^[^\S\r\n]*HighDynamicRangeUserEnabled[^\S\r\n]*:[^\S\r\n]*True[^\S\r\n]*$'
+    )
+    $hdrSupported = [bool]($hdrText -match '(?m)^[^\S\r\n]*HighDynamicRangeSupported[^\S\r\n]*:[^\S\r\n]*True[^\S\r\n]*$')
+
+    $brightnessOutput = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $brightnessHidScript -GetPercent 2>&1)
+    $brightnessExitCode = $LASTEXITCODE
+    $brightnessText = ($brightnessOutput -join "`n")
+    $brightnessOk = [bool]($brightnessExitCode -eq 0 -and $brightnessText -match '(?m)^\s*\d+\s*$')
+    $brightnessPercent = $null
+    if ($brightnessOk -and $brightnessText -match '(?m)^\s*(\d+)\s*$') {
+        $brightnessPercent = [int]$Matches[1]
+    }
+
+    $ready = [bool](
+        $resolutionExitCode -eq 0 -and
+        $hasCurrent5K -and
+        $has5K60Enumerated -and
+        $hdrExitCode -eq 0 -and
+        $hdrSupported -and
+        $hdrActive -and
+        $brightnessOk
+    )
+
+    return [pscustomobject]@{
+        Ready = $ready
+        Detail = "resolutionExit=$resolutionExitCode,current5K=$hasCurrent5K,5K60Enumerated=$has5K60Enumerated,hdrExit=$hdrExitCode,hdrSupported=$hdrSupported,hdrActive=$hdrActive,brightnessExit=$brightnessExitCode,brightnessOk=$brightnessOk"
+        ResolutionExitCode = $resolutionExitCode
+        Current5K = $hasCurrent5K
+        FiveK60Enumerated = $has5K60Enumerated
+        HdrExitCode = $hdrExitCode
+        HdrSupported = $hdrSupported
+        HdrActive = $hdrActive
+        BrightnessExitCode = $brightnessExitCode
+        BrightnessOk = $brightnessOk
+        BrightnessPercent = $brightnessPercent
+    }
+}
+
+function Save-AutoRepairKnownGoodState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State,
+        [string]$Reason = "",
+        [string]$RepairLog = ""
+    )
+
+    if (-not $State.Ready) {
+        return
+    }
+
+    try {
+        $knownGoodState = [pscustomobject]@{
+            Version = 1
+            UpdatedAt = (Get-Date).ToString("o")
+            Reason = $Reason
+            RepairLog = $RepairLog
+            CodeZeroReady = [bool]$State.Ready
+            Current5K = [bool]$State.Current5K
+            FiveK60Enumerated = [bool]$State.FiveK60Enumerated
+            HdrSupported = [bool]$State.HdrSupported
+            HdrActive = [bool]$State.HdrActive
+            BrightnessOk = [bool]$State.BrightnessOk
+            BrightnessPercent = $State.BrightnessPercent
+            ValidationDetail = $State.Detail
+            SuccessRecipe = @(
+                "Detect active MS_0001 monitor identity inside integrated repair.",
+                "Use the Boot Camp-style monitor INF as the single default MS_0001 HDR identity; Generic/Digital Flat Panel fallback is diagnostic-only.",
+                "Refresh Boot Camp-style monitor INF when MS_0001 uses monitor.inf, the generated driver package is missing, the current binding is not this project's oem*.inf, or the active EDID cache lacks HDR static metadata.",
+                "Wait for the Boot Camp-style MS_0001 identity to settle before HDR, then retrain the Apple Studio Display XDR USB4 router when needed.",
+                "Require current 5120x2880 and an enumerated 5120x2880@60 mode table entry.",
+                "Require HighDynamicRangeSupported=True and ActiveColorMode=HDR or HighDynamicRangeUserEnabled=True.",
+                "Require Studio Display HID brightness readback before returning code=0."
+            )
+        }
+
+        $knownGoodState |
+            ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $knownGoodStateFile -Encoding ascii
+        Write-AutoRepairLog "Saved known-good Studio Display recovery state. File=$knownGoodStateFile"
+    }
+    catch {
+        Write-AutoRepairLog "Could not save known-good Studio Display recovery state: $($_.Exception.Message)"
+    }
+}
+
+function Save-AutoRepairFailureState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State,
+        [int]$ExitCode,
+        [string]$Reason = "",
+        [string]$RepairLog = ""
+    )
+
+    try {
+        $repairLogText = ""
+        if (-not [string]::IsNullOrWhiteSpace($RepairLog) -and (Test-Path -LiteralPath $RepairLog)) {
+            $repairLogText = Get-Content -LiteralPath $RepairLog -Raw -ErrorAction SilentlyContinue
+        }
+
+        $hdrGateBlocked = [bool](
+            $State.Current5K -and
+            $State.FiveK60Enumerated -and
+            -not $State.HdrSupported -and
+            -not $State.HdrActive
+        )
+        $appleUsbReferenceModeFailedStart = [bool](
+            $repairLogText -match 'CM_PROB_FAILED_START' -and
+            (
+                $repairLogText -match 'VID_05AC&PID_1116&MI_08' -or
+                $repairLogText -match 'VID_05AC&PID_1116&MI_09'
+            )
+        )
+        $classification = if ($hdrGateBlocked -and $appleUsbReferenceModeFailedStart) {
+            "HdrGateBlockedWithAppleUsbReferenceModeFailedStart"
+        }
+        elseif ($hdrGateBlocked) {
+            "HdrGateBlockedWithStable5K60"
+        }
+        elseif (-not $State.FiveK60Enumerated) {
+            "ResolutionModeTableBlocked"
+        }
+        elseif (-not $State.BrightnessOk) {
+            "BrightnessHidReadbackBlocked"
+        }
+        else {
+            "Unknown"
+        }
+
+        $failureState = [pscustomobject]@{
+            Version = 1
+            UpdatedAt = (Get-Date).ToString("o")
+            Reason = $Reason
+            ExitCode = $ExitCode
+            Classification = $classification
+            RepairLog = $RepairLog
+            Current5K = [bool]$State.Current5K
+            FiveK60Enumerated = [bool]$State.FiveK60Enumerated
+            HdrSupported = [bool]$State.HdrSupported
+            HdrActive = [bool]$State.HdrActive
+            BrightnessOk = [bool]$State.BrightnessOk
+            BrightnessPercent = $State.BrightnessPercent
+            AppleUsbReferenceModeFailedStart = $appleUsbReferenceModeFailedStart
+            ValidationDetail = $State.Detail
+            NextAction = if ($appleUsbReferenceModeFailedStart) {
+                "Stop repeating HDR packets. Keep 5K60 and brightness, back off deep repair, and wait for a fresh Thunderbolt/USB4 physical re-enumeration or power-resume event before retrying."
+            }
+            elseif ($hdrGateBlocked) {
+                "Stop repeating HDR packets. Keep 5K60 and brightness, and retry only after reconnect, resume, or a controlled identity/link refresh."
+            }
+            else {
+                "Review the repair log before retrying disruptive topology, USB4, or HDR stages."
+            }
+        }
+
+        $failureState |
+            ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $lastFailureStateFile -Encoding ascii
+        Write-AutoRepairLog "Saved last failure state. classification=$classification File=$lastFailureStateFile"
+    }
+    catch {
+        Write-AutoRepairLog "Could not save last failure state: $($_.Exception.Message)"
+    }
+}
+
+function Wait-AutoRepairCodeZeroState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InitialState,
+        [string]$RepairLog = "",
+        [int]$TimeoutSeconds = 210,
+        [int]$PollSeconds = 5
+    )
+
+    $state = $InitialState
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $waitReasonLogged = $false
+
+    while (-not $state.Ready -and (Get-Date) -lt $deadline) {
+        $shouldKeepWaiting = $true
+        if ($RepairLog -and (Test-Path -LiteralPath $RepairLog)) {
+            try {
+                $tail = (Get-Content -LiteralPath $RepairLog -Tail 80 -ErrorAction Stop) -join "`n"
+                if ($tail -match 'Integrated repair finished, but|Integrated repair finished successfully') {
+                    $shouldKeepWaiting = $false
+                }
+                elseif ($tail -match 'Elevated integrated repair was launched|Running Studio Display XDR link refresh|Running external-only topology repair|Running advanced color validation|Running brightness HID get') {
+                    $shouldKeepWaiting = $true
+                }
+            }
+            catch {
+                $shouldKeepWaiting = $true
+            }
+        }
+
+        if (-not $shouldKeepWaiting) {
+            break
+        }
+
+        if (-not $waitReasonLogged) {
+            Write-AutoRepairLog "Child repair returned before final probes were ready; waiting for the elevated/in-progress repair transaction to settle before overriding the exit code. Current: $($state.Detail)"
+            $waitReasonLogged = $true
+        }
+
+        Start-Sleep -Seconds $PollSeconds
+        $state = Test-AutoRepairCodeZeroState
+    }
+
+    return $state
+}
+
+if ($ValidateOnly) {
+    $codeZeroState = Test-AutoRepairCodeZeroState
+    $exitCode = if ($codeZeroState.Ready) { 0 } else { 6 }
+    if ($codeZeroState.Ready) {
+        Save-AutoRepairKnownGoodState -State $codeZeroState -Reason "$Reason validate-only"
+    }
+    else {
+        Save-AutoRepairFailureState -State $codeZeroState -ExitCode $exitCode -Reason "$Reason validate-only"
+    }
+    Write-AutoRepairLog "Scheduled auto repair validate-only finished with exit code $exitCode. $($codeZeroState.Detail)"
+    exit $exitCode
+}
+
 Write-AutoRepairLog "Scheduled auto repair started. Reason=$Reason Log=$logPath"
 
 if (-not (Test-Path -LiteralPath $integratedRepairScript)) {
@@ -28,8 +298,45 @@ if (-not (Test-Path -LiteralPath $integratedRepairScript)) {
     exit 1
 }
 
+$preRepairState = Test-AutoRepairCodeZeroState
+if ($preRepairState.Ready) {
+    Save-AutoRepairKnownGoodState -State $preRepairState -Reason "$Reason preflight already healthy"
+    Write-AutoRepairLog "Scheduled auto repair skipped disruptive repair because preflight is already code=0. $($preRepairState.Detail)"
+    exit 0
+}
+
 & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $integratedRepairScript -Apply -RestartAppleUsb4Router -LogPath $logPath
 $exitCode = $LASTEXITCODE
+
+$failureStateSaved = $false
+if ($exitCode -eq 0) {
+    $codeZeroState = Test-AutoRepairCodeZeroState
+    if ($codeZeroState.Ready) {
+        Save-AutoRepairKnownGoodState -State $codeZeroState -Reason $Reason -RepairLog $logPath
+        Write-AutoRepairLog "Scheduled auto repair code=0 final validation passed. $($codeZeroState.Detail)"
+    }
+    else {
+        $codeZeroState = Wait-AutoRepairCodeZeroState -InitialState $codeZeroState -RepairLog $logPath
+        if ($codeZeroState.Ready) {
+            Save-AutoRepairKnownGoodState -State $codeZeroState -Reason $Reason -RepairLog $logPath
+            Write-AutoRepairLog "Scheduled auto repair code=0 final validation passed after waiting for the elevated/in-progress transaction. $($codeZeroState.Detail)"
+        }
+        else {
+            Write-AutoRepairLog "Scheduled auto repair child returned code=0, but final validation failed after waiting. Overriding to exit code 6. $($codeZeroState.Detail)"
+            $exitCode = 6
+        }
+    }
+}
+else {
+    $failureState = Test-AutoRepairCodeZeroState
+    Save-AutoRepairFailureState -State $failureState -ExitCode $exitCode -Reason $Reason -RepairLog $logPath
+    $failureStateSaved = $true
+}
+
+if ($exitCode -ne 0 -and -not $failureStateSaved) {
+    $failureState = if ($codeZeroState) { $codeZeroState } else { Test-AutoRepairCodeZeroState }
+    Save-AutoRepairFailureState -State $failureState -ExitCode $exitCode -Reason $Reason -RepairLog $logPath
+}
 
 Write-AutoRepairLog "Scheduled auto repair finished with exit code $exitCode. Log=$logPath"
 exit $exitCode

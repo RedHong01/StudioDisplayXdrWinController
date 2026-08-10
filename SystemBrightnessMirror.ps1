@@ -31,6 +31,23 @@ function Write-Log {
     Add-Content -LiteralPath $logPath -Value "$timestamp $Message"
 }
 
+function Sync-ManagedPidFile {
+    try {
+        $existingPid = $null
+        if (Test-Path $pidFile) {
+            $existingPid = Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+
+        if ([string]$existingPid -ne [string]$PID) {
+            Set-Content -LiteralPath $pidFile -Value $PID -Encoding ascii -ErrorAction Stop
+            Write-Log "System brightness mirror refreshed managed pid file with PID=$PID."
+        }
+    }
+    catch {
+        Write-Log "System brightness mirror could not refresh managed pid file: $($_.Exception.Message)"
+    }
+}
+
 function Get-InternalBrightnessPercent {
     $monitor = Get-WmiObject -Namespace root\wmi -Class WmiMonitorBrightness |
         Where-Object { $_.Active -eq $true } |
@@ -101,7 +118,8 @@ function Get-SuppressedDirection {
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 if (-not $createdNew) {
-    exit 0
+    Write-Log "Another system brightness mirror instance is already running; exiting this duplicate instance."
+    exit 2
 }
 
 Set-Content -LiteralPath $pidFile -Value $PID -Encoding ascii
@@ -111,6 +129,7 @@ try {
     $lastInternalPercent = $initialPercent
     $startupSyncPercent = $initialPercent
     $lastRecoveryAttempt = [DateTime]::UtcNow
+    $lastPidRefresh = [DateTime]::UtcNow
     $studioDisplayAvailable = $false
     Write-Log "Initial internal brightness is $initialPercent%."
 
@@ -189,6 +208,11 @@ try {
             } else {
                 $studioDisplayAvailable = $false
             }
+        }
+
+        if (([DateTime]::UtcNow - $lastPidRefresh).TotalSeconds -ge 5) {
+            $lastPidRefresh = [DateTime]::UtcNow
+            Sync-ManagedPidFile
         }
 
         Start-Sleep -Milliseconds $pollIntervalMilliseconds

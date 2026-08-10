@@ -104,6 +104,24 @@ powershell -ExecutionPolicy Bypass -File .\Install-StudioDisplayTools.ps1 `
 - `Repair-StudioDisplayIntegrated.ps1`
   Orchestrates the current safe repair order: 5K mode-table validation, USB4
   retrain when needed, HDR attempt, and brightness HID validation.
+- `Invoke-StudioDisplayAutoRepair.ps1 -ValidateOnly`
+  Non-disruptive final-state validator used by automation. It returns success
+  only when 5K60 is current/enumerated, HDR is supported and active, and
+  Studio Display HID brightness is readable. When that final gate passes, it
+  also records `StudioDisplayKnownGoodState.json` in the installed controller
+  folder so later hot-plug debugging has a single known-good baseline.
+- `Test-StudioDisplayHotplugAutomation.ps1`
+  Read-only audit for the hot-plug automation chain. It checks that the tray,
+  brightness workers, elevated scheduled task, Boot Camp-style success recipe,
+  5K60/HDR/brightness gates, and known-good state are aligned. Add
+  `-RunScheduledTask` to run the scheduled task once; the launcher preflights
+  `code=0` first, so a healthy system exits without disruptive USB4/HDR repair.
+- `Watch-StudioDisplayHotplugAutomation.ps1`
+  Passive hot-plug observer. It records the current repair stage, task state,
+  5K mode table, HDR gate, Apple `VID_05AC&PID_1116` `MI_08`/`MI_09` state,
+  brightness worker state, and possible user-input overlap without modifying
+  display state. The tray starts it for reconnect/startup/resume/topology
+  events so failed automatic runs leave a structured summary.
 - `Show-StudioDisplayRepairProgress.ps1`
   Displays progress while the integrated repair performs topology, USB4, HDR,
   and brightness stages.
@@ -223,6 +241,20 @@ This repo currently uses:
   HDR enable request; if the gate is false or unknown, it queues the full
   integrated USB4/5K/HDR repair path through the installed on-demand elevated
   auto-repair task and keeps retry state pending until live probes verify HDR
+- a transaction guard for the elevated auto-repair task: topology/lid-state
+  events that arrive while the integrated task is already running are coalesced
+  into the current repair instead of launching another topology refresh or task
+  run
+- an HDR-gate backoff state: when the desktop is already stable at 5K60 but
+  Windows still reports `HighDynamicRangeSupported=False`, the controller stops
+  looping deep repairs and waits for a fresh Thunderbolt reconnect, power
+  resume, successful HDR probe, or the next controlled retry window; this
+  backoff is persisted locally so restarting the tray does not immediately
+  repeat the same failed HDR-gate repair
+- a one-click repair preflight: the tray checks current 5K60 mode, enumerated
+  5K60 support, HDR active state, brightness worker processes, and the hardware
+  brightness HID read before it runs a disruptive repair; if everything is
+  already healthy, it skips the repair
 - a native-mode guard that refuses to treat fallback modes such as
   `1920x1080@60` as success unless `-AllowLowResolutionFallback` is passed
 - a silent-first automation guard: background repair avoids `DisplaySwitch.exe`
@@ -232,20 +264,54 @@ This repo currently uses:
 That keeps reconnect behavior conservative while reducing extra fullscreen-exit
 flash.
 
-The tray UI intentionally exposes one safe repair entry:
-`统一修复：5K/HDR/亮度`. Older EDID override, Boot Camp-style monitor-driver,
-and HDR rollback helpers are still available as explicit advanced scripts, but
-they are no longer default tray buttons because running them independently can
-break the repair order that keeps topology, HDR, and brightness aligned.
+The tray UI intentionally keeps one safe repair entry visible:
+`重建 Boot Camp-style 5K60 HDR 管线`. Lower-level user-safe actions are grouped into
+`亮度控制`, `HDR/亮度`, and `高级/诊断`. Direct external-only/link-refresh tray
+buttons were removed because running them separately can race the unified
+topology, 5K ladder, HDR, and brightness order. The installed controller and
+release package expose one working recovery path: Boot Camp-style `MS_0001`
+identity, USB4 retrain, HDR gate, and brightness validation.
 
-When the repair is launched manually from the tray, the controller opens a
-small progress window before running the disruptive stages. Automatic hot-plug
-repair instead runs through a hidden on-demand elevated scheduled task so USB4
-and HDR recovery can run without a fresh UAC prompt on every Thunderbolt
-reconnect. Temporary black screens or display flashes can still happen when
-Windows changes topology, re-enumerates USB4, or applies HDR; automatic progress
-is reflected in the tray status and the logs under the installed `reports`
-folder.
+During a manual pipeline rebuild, the progress window plays periodic system
+sounds so the user still gets feedback if the display is temporarily blank. If
+the user presses `Space`, the progress host stops waiting for the full
+Boot Camp-style HDR identity and applies a quick visible external fallback
+instead. That fallback is deliberately not counted as HDR success; use the tray
+entry above to rebuild the full 5K60 HDR pipeline afterward. While that temporary
+fallback marker is present, the tray relabels the main action to
+`从 fallback 重建 Boot Camp-style 5K60 HDR 管线` and keeps the degraded status visible
+until independent probes confirm 5K60, HDR, and brightness again.
+
+When the repair is launched manually from the tray, the controller first
+summarizes the missing conditions. If only the brightness workers are stopped,
+it restarts them without running topology/HDR repair. If deep USB4/HDR/Apple HID
+repair is required and the tray is not already elevated, Windows UAC is shown
+immediately before the progress window starts. The progress window tracks the
+actual repair child process and stops with a useful status even if a script
+exits before writing its final completion marker.
+
+Automatic hot-plug repair instead runs through a hidden on-demand elevated
+scheduled task so USB4 and HDR recovery can run without a fresh UAC prompt on
+every Thunderbolt reconnect. Temporary black screens or display flashes can
+still happen when Windows changes topology, re-enumerates USB4, or applies HDR,
+but the integrated script now skips external-only/5K/HDR stages that are already
+satisfied. Tray startup and hot-plug topology handling use the same stable-5K60
+guard, so they do not bounce through the 2K safety mode when the Studio Display
+is already the only active 5K60 screen. Automatic progress is reflected in the
+tray status and the logs under the installed `reports` folder.
+
+Hot-plug automation no longer runs a standalone external-topology repair before
+HDR. Reconnect, resume, and topology-change events now queue the same integrated
+pipeline used by the one-click repair, and that pipeline decides which stages
+can be skipped.
+
+The successful recovery recipe is persisted only after the launcher reaches
+`code=0`: current 5120x2880, enumerated 5120x2880@60, HDR supported and active,
+and readable Studio Display HID brightness. If the active `MS_0001` monitor
+identity appears, the controller treats the Boot Camp-style monitor INF as the
+single default HDR path. Generic/Digital Flat Panel `monitor.inf` can preserve a
+5K mode table, but it is diagnostic-only because it has repeatedly failed to
+open the HDR capability gate on this setup.
 
 Automatic repair is intentionally quiet-first. It uses `SetDisplayConfig`,
 PnP rescans, monitor restart, and Apple USB4 router retraining before any
@@ -254,12 +320,25 @@ graphics reset hotkey are reserved for explicit manual troubleshooting flags so
 background brightness/HDR recovery does not steal focus from games, calls, or
 work apps.
 
+Discord/game-specific repair helpers are not part of the public controller.
+Game resolution issues should be handled through the generic mode-table
+diagnostic method in `docs/Game-Resolution-Troubleshooting.md`, not by shipping
+per-app fixers in the tray or release package.
+
 Windows does not allow a non-elevated tray app to silently grant itself
 administrator rights. The controller therefore bootstraps this safely: if the
 on-demand elevated task is missing, the tray can launch a one-time UAC prompt to
 register it. Approve that prompt once; future hot-plug repair runs through the
 registered task without asking again. You can also trigger the same prompt from
 the tray entry `自动修复权限：注册/修复`.
+
+The installer also repairs this permission path. It first checks whether the
+on-demand task already exists and points at the current install folder. If the
+task is missing or stale and the installer is not already elevated, it launches
+the same registrar through UAC, waits for it to finish, and verifies success
+through Task Scheduler or the registrar log. A normal non-elevated PowerShell
+session may still fail to query the task with `Access denied` or a misleading
+`schtasks` error; that does not necessarily mean hot-plug repair is broken.
 
 ### Studio Display XDR 1080p Fallback
 
@@ -333,18 +412,19 @@ desktop is 5K but the mode table only exposes 1080p, the integrated repair
 does USB4/monitor re-enumeration first and skips HDR writes until the mode table
 is stable.
 
-Only include the HDR EDID/Boot Camp-style monitor-driver fallback for an
-explicit advanced fallback repair. It is intentionally not part of the tray
-default, because a normal hot-plug repair should first try to restore the
-Apple/XDR route instead of pinning the active monitor path back to `MS_0001`:
+The integrated repair includes the Boot Camp-style monitor-driver identity for
+active `MS_0001` sessions by default. This keeps hot-plug recovery on one
+transactional path instead of racing Generic/Digital Flat Panel fallback against
+the Boot Camp-style identity:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Repair-StudioDisplayIntegrated.ps1 -Apply -Elevate -EnsureBootCampMonitorDriver -RestartAppleUsb4Router
 ```
 
-That advanced path pauses the brightness mirror and brightness-key bridge
-before display re-enumeration, installs or refreshes the monitor INF, retrains
-USB4, attempts HDR, and only then restores the brightness services.
+That path pauses the brightness mirror and brightness-key bridge before display
+re-enumeration, installs or verifies the monitor INF, waits for the
+Boot Camp-style identity to settle, retrains USB4, attempts HDR, and only then
+restores the brightness services.
 
 See `docs/Integrated-Repair-Rules.md` for the rules this pipeline must preserve
 when new HDR, USB4, display-mode, or brightness fixes are added.
@@ -394,7 +474,7 @@ firmware or macOS behavior. To remove the local certificate later:
 powershell -ExecutionPolicy Bypass -File .\Remove-StudioDisplayLocalSigningCertificate.ps1 -Elevate
 ```
 
-### Boot Camp-Style HDR Fallback
+### Boot Camp-Style HDR Identity
 
 Apple's Boot Camp path is broader than a simple HDR toggle. It combines current
 Apple Windows support software, a monitor driver/INF layer, Apple display
@@ -416,11 +496,12 @@ Attempt installation with administrator elevation:
 powershell -ExecutionPolicy Bypass -File .\Install-StudioDisplayBootCampStyleMonitorDriver.ps1 -EnableHdrMetadata -Apply -Elevate
 ```
 
-This is the second-level fallback after the direct EDID override. It is still
-Windows-local and does not alter the display EEPROM, firmware, or macOS
-behavior. If Windows rejects the unsigned INF, the generated package and log are
-left under `drivers\StudioDisplayXdrBootCampStyleMonitor\` for manual
-inspection or signing.
+For active `MS_0001` sessions, this is the default HDR identity used by the
+integrated repair. It is still Windows-local and does not alter the display
+EEPROM, firmware, or macOS behavior. If Windows rejects the unsigned INF, the
+generated package and log are left under
+`drivers\StudioDisplayXdrBootCampStyleMonitor\` for manual inspection or
+signing.
 
 ## Game Resolution Method
 

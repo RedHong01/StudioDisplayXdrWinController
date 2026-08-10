@@ -33,6 +33,23 @@ function Write-BridgeLog {
     Add-Content -LiteralPath $logPath -Value "$timestamp $Message"
 }
 
+function Sync-ManagedPidFile {
+    try {
+        $existingPid = $null
+        if (Test-Path $pidFile) {
+            $existingPid = Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+
+        if ([string]$existingPid -ne [string]$PID) {
+            Set-Content -LiteralPath $pidFile -Value $PID -Encoding ascii -ErrorAction Stop
+            Write-BridgeLog "Brightness key bridge refreshed managed pid file with PID=$PID."
+        }
+    }
+    catch {
+        Write-BridgeLog "Brightness key bridge could not refresh managed pid file: $($_.Exception.Message)"
+    }
+}
+
 function Get-ClampedPercent {
     param([int]$Value)
 
@@ -509,7 +526,7 @@ $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 if (-not $createdNew) {
     Write-BridgeLog "Another brightness key bridge instance is already running; exiting this duplicate instance."
-    exit 0
+    exit 2
 }
 
 Set-Content -LiteralPath $pidFile -Value $PID -Encoding ascii
@@ -525,11 +542,20 @@ try {
         }
     }
 
+    $pidRefreshTimer = New-Object System.Windows.Forms.Timer
+    $pidRefreshTimer.Interval = 5000
+    $pidRefreshTimer.add_Tick({ Sync-ManagedPidFile })
+    $pidRefreshTimer.Start()
+
     $bridge = New-Object BrightnessKeyBridge($callback, $logPath, $EnableLogging.IsPresent, $VerboseConsumerLog.IsPresent, $CaptureF1F2BrightnessKeys.IsPresent)
     try {
         [System.Windows.Forms.Application]::Run()
     }
     finally {
+        if ($pidRefreshTimer) {
+            $pidRefreshTimer.Stop()
+            $pidRefreshTimer.Dispose()
+        }
         $bridge.Dispose()
     }
 }
