@@ -1,0 +1,21 @@
+# Runtime state generated on this machine.
+*.pid
+*.log
+*.bak
+*.tmp
+
+# Local diagnostic output and generated repair reports.
+reports/
+backups/
+
+# Per-machine display/HDR state snapshots.
+StudioDisplayAutomationMaintenanceState.json
+StudioDisplayFastVisibleFallbackState.json
+StudioDisplayHdrGateBlockState.json
+StudioDisplayHotplugPipelineDecision.json
+StudioDisplayKnownGoodState.json
+StudioDisplayLastFailureState.json
+StudioDisplayResolutionModeTableBlockState.json
+
+# Driver payloads can be machine-specific; keep installer scripts in source.
+drivers/
