@@ -45,6 +45,7 @@ Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 $script:effectiveEnsureBootCampMonitorDriver = [bool]$EnsureBootCampMonitorDriver
 $script:bootCampModeTableRebindAttempted = $false
 $script:modeTableRegistryNudgeAttempted = $false
+$script:nativeIdentityRefreshAttempted = $false
 $script:bootCampDriverSkippedBecauseIdentityReady = $false
 $script:bootCampDriverSuccessFallbackAttempted = $false
 $script:stageTimings = New-Object System.Collections.Generic.List[object]
@@ -967,13 +968,16 @@ function Wait-For5K60ModeTableRecovery {
 }
 
 function Invoke-LinkRefreshIfNeeded {
-    param([object]$InitialState)
+    param(
+        [object]$InitialState,
+        [switch]$Force
+    )
 
-    if ($SkipHdr -and $SkipBrightness -and -not $ForceLinkRefresh) {
+    if ($SkipHdr -and $SkipBrightness -and -not $ForceLinkRefresh -and -not $Force) {
         return $InitialState
     }
 
-    $needsRefresh = $ForceLinkRefresh -or $script:effectiveEnsureBootCampMonitorDriver -or -not $InitialState.Has5K60
+    $needsRefresh = $Force -or $ForceLinkRefresh -or $script:effectiveEnsureBootCampMonitorDriver -or -not $InitialState.Has5K60
     if (-not $needsRefresh) {
         Write-RepairLog "5K60 is already enumerated. Skipping USB4 link refresh."
         return $InitialState
@@ -988,6 +992,9 @@ function Invoke-LinkRefreshIfNeeded {
         }
         elseif ($ForceLinkRefresh) {
             Write-RepairLog "Dry run: forced USB4 link refresh was requested but -Apply was not passed."
+        }
+        elseif ($Force) {
+            Write-RepairLog "Dry run: native identity USB4 link refresh was requested but -Apply was not passed."
         }
         else {
             Write-RepairLog "Dry run: USB4 link refresh would be started, but -Apply was not passed."
@@ -1012,7 +1019,7 @@ function Invoke-LinkRefreshIfNeeded {
         "-RestartFallbackMonitor"
     )
 
-    if ($RestartAppleUsb4Router -or $script:effectiveEnsureBootCampMonitorDriver -or -not $InitialState.Has5K60) {
+    if ($RestartAppleUsb4Router -or $script:effectiveEnsureBootCampMonitorDriver -or $Force -or -not $InitialState.Has5K60) {
         $refreshArgs += "-RestartAppleUsb4Router"
     }
 
@@ -1080,6 +1087,96 @@ function Wait-BootCampStyleMonitorIdentity {
 
     Write-RepairLog "Boot Camp-style monitor identity did not become ready before HDR timeout. $($lastState.Summary)"
     return $lastState
+}
+
+function Invoke-HdrCapabilityNativeIdentityRefreshIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ResolutionState,
+        [Parameter(Mandatory = $true)]
+        [object]$IdentityState,
+        [Parameter(Mandatory = $true)]
+        [object]$HdrState,
+        [bool]$ExternalOnlyReady,
+        [object]$PersistedAppleUsbRebootGate
+    )
+
+    $currentResult = {
+        param([bool]$Attempted = $false)
+
+        [pscustomobject]@{
+            ResolutionState = $ResolutionState
+            IdentityState = $IdentityState
+            HdrState = $HdrState
+            ExternalOnlyReady = $ExternalOnlyReady
+            Attempted = $Attempted
+        }
+    }
+
+    if ($script:nativeIdentityRefreshAttempted) {
+        return & $currentResult
+    }
+
+    $needsNativeIdentityRefresh = [bool](
+        $ResolutionState.Has5K60Enumerated -and
+        $IdentityState.ActiveMs0001 -and
+        $IdentityState.BootCampStyleReady -and
+        $HdrState.HdrUnsupported -and
+        -not $HdrState.HdrActive
+    )
+
+    if (-not $needsNativeIdentityRefresh) {
+        return & $currentResult
+    }
+
+    if ($PersistedAppleUsbRebootGate -and [bool]$PersistedAppleUsbRebootGate.Active) {
+        Write-RepairLog "Native APPA identity refresh skipped because an existing Apple USB reboot-required HDR gate is active (source=$($PersistedAppleUsbRebootGate.Source), updatedAt=$($PersistedAppleUsbRebootGate.UpdatedAt)). Waiting for reboot/resume/full Thunderbolt re-enumeration instead of causing extra topology churn."
+        return & $currentResult
+    }
+
+    if (-not $Apply) {
+        Write-RepairLog "Dry run: HDR is unsupported while stable 5K60 is exposed through active MS_0001; would run one non-destructive native APPA identity USB4/link refresh before Apple USB deep repair."
+        return & $currentResult
+    }
+
+    if (-not (Test-IsAdministrator)) {
+        Write-RepairLog "Native APPA identity refresh skipped because this process is not elevated."
+        return & $currentResult
+    }
+
+    $script:nativeIdentityRefreshAttempted = $true
+    Write-RepairLog "HDR is unsupported while stable 5K60 is exposed through active MS_0001. Replaying the known-good a07bebe recovery shape: run one non-destructive monitor/router USB4 refresh to give Windows a chance to re-activate the native APPA Studio Display identity before Apple USB/HID deep repair."
+
+    $afterRefreshState = Invoke-RepairStage -Label "Native APPA identity USB4/link refresh" -ScriptBlock { Invoke-LinkRefreshIfNeeded -InitialState $ResolutionState -Force }
+    Write-RepairLog "Resolution state after native APPA identity refresh: $($afterRefreshState.Summary)"
+
+    $afterIdentityState = Invoke-RepairStage -Label "Boot Camp-style identity settle after native APPA refresh" -ScriptBlock { Wait-BootCampStyleMonitorIdentity -TimeoutSeconds 24 }
+    $afterExternalOnlyReady = $ExternalOnlyReady
+    if ($afterRefreshState.Has5K60Enumerated) {
+        $afterExternalOnlyReady = Invoke-RepairStage -Label "External-only topology preflight after native APPA refresh" -ScriptBlock { Test-ExternalOnlyScreenTopologyReady }
+        if (-not $afterExternalOnlyReady) {
+            Write-RepairLog "External-only topology was not verified after native APPA refresh. Re-running external-only topology repair before HDR/Apple USB gates."
+            $afterExternalOnlyReady = Invoke-RepairStage -Label "External-only topology repair after native APPA refresh" -ScriptBlock { Invoke-ExternalOnlyTopologyRepair }
+        }
+    }
+
+    $afterHdrState = Invoke-RepairStage -Label "HDR preflight after native APPA refresh" -ScriptBlock { Get-HdrRuntimeState }
+    Write-RepairLog "HDR state after native APPA identity refresh: $(Format-HdrRuntimeState -State $afterHdrState)"
+
+    if (-not $afterIdentityState.ActiveMs0001 -and ($afterHdrState.HdrSupported -or $afterHdrState.HdrActive)) {
+        Write-RepairLog "Native APPA identity refresh reopened the HDR capability path: active display is no longer DISPLAY\\MS_0001 and Windows reports HDR support/active state."
+    }
+    elseif ($afterIdentityState.ActiveMs0001 -and $afterHdrState.HdrUnsupported) {
+        Write-RepairLog "Native APPA identity refresh did not move the active display off DISPLAY\\MS_0001; continuing to Apple USB/HID evidence collection instead of deleting or reinstalling the monitor driver."
+    }
+
+    return [pscustomobject]@{
+        ResolutionState = $afterRefreshState
+        IdentityState = $afterIdentityState
+        HdrState = $afterHdrState
+        ExternalOnlyReady = [bool]$afterExternalOnlyReady
+        Attempted = $true
+    }
 }
 
 function Invoke-BootCampModeTableRebindIfNeeded {
@@ -1899,17 +1996,24 @@ try {
     if ($shouldRunHdrRepair) {
         $hdrPreflightState = Invoke-RepairStage -Label "HDR preflight" -ScriptBlock { Get-HdrRuntimeState }
         Write-RepairLog "HDR preflight: $(Format-HdrRuntimeState -State $hdrPreflightState)"
+        $persistedAppleUsbRebootGate = Get-PersistedAppleUsbRebootRequiredGate
 
         if ($hdrPreflightState.HdrUnsupported) {
-            Write-RepairLog "HDR gate is closed even though the Boot Camp-style MS_0001 identity is ready. Keeping the single Boot Camp-style pipeline and not falling back to Generic/Digital Flat Panel or WCG."
-            Write-AppleDisplayUsbProblemSummary
+            Write-RepairLog "HDR gate is closed even though the Boot Camp-style MS_0001 identity is ready. Trying the known-good native APPA identity refresh path before Apple USB/HID deep repair; Generic/Digital Flat Panel and monitor-INF rollback remain diagnostic-only."
+            $nativeIdentityRefresh = Invoke-HdrCapabilityNativeIdentityRefreshIfNeeded -ResolutionState $postRefreshState -IdentityState $bootCampIdentityState -HdrState $hdrPreflightState -ExternalOnlyReady:$externalOnlyReady -PersistedAppleUsbRebootGate $persistedAppleUsbRebootGate
+            $postRefreshState = $nativeIdentityRefresh.ResolutionState
+            $bootCampIdentityState = $nativeIdentityRefresh.IdentityState
+            $hdrPreflightState = $nativeIdentityRefresh.HdrState
+            $externalOnlyReady = [bool]$nativeIdentityRefresh.ExternalOnlyReady
+            if ($hdrPreflightState.HdrUnsupported) {
+                Write-AppleDisplayUsbProblemSummary
+            }
         }
 
         $brightnessHidReadyBeforeRepair = Invoke-RepairStage -Label "Brightness HID preflight" -ScriptBlock { Test-BrightnessHidReadyQuiet }
         $needsAppleUsbRepair = [bool](-not $hdrPreflightState.HdrActive -or -not $brightnessHidReadyBeforeRepair)
         $hdrStateAfterAppleUsbRepair = $hdrPreflightState
         $appleUsbRepairSkipReason = ""
-        $persistedAppleUsbRebootGate = Get-PersistedAppleUsbRebootRequiredGate
 
         if (
             $needsAppleUsbRepair -and
