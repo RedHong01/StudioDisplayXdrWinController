@@ -84,6 +84,7 @@ function Save-AutoRepairMaintenanceState {
             Gate = if ($GateState) {
                 [ordered]@{
                     RequiresPhysicalReenumeration = [bool]$GateState.RequiresPhysicalReenumeration
+                    AppleUsbRebootRequired = [bool]$GateState.AppleUsbRebootRequired
                     BlockedUntil = [string]$GateState.BlockedUntil
                     Reason = [string]$GateState.Reason
                     UpdatedAt = [string]$GateState.UpdatedAt
@@ -102,6 +103,7 @@ function Save-AutoRepairMaintenanceState {
             SuccessPrerequisites = @(
                 "Do not run disruptive repair when stable 5K60 is already present and Windows still says HighDynamicRangeSupported=False after Apple USB failed-start evidence.",
                 "Wait for reconnect, resume, reboot, or a later probe where HighDynamicRangeSupported=True before SET_HDR_STATE.",
+                "If Apple USB repair saw pnputil 3010, do not run HDR identity rollback again until Windows has completed device configuration through reboot or full physical re-enumeration.",
                 "Keep brightness and 5K visible state intact while the HDR capability gate is closed."
             )
         }
@@ -136,7 +138,8 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
                 $lastFailure -and
                 (
                     [bool]$lastFailure.AppleUsbReferenceModeFailedStart -or
-                    $classification -match 'AppleUsbReferenceModeFailedStart'
+                    [bool]$lastFailure.AppleUsbRebootRequired -or
+                    $classification -match 'AppleUsbReferenceModeFailedStart|AppleUsbRebootRequired|RebootRequired'
                 )
             )
 
@@ -149,6 +152,7 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
                 BlockedUntil = (Get-Date).AddHours(12).ToString("o")
                 Count = 1
                 RequiresPhysicalReenumeration = $true
+                AppleUsbRebootRequired = [bool]$lastFailure.AppleUsbRebootRequired
                 Reason = "auto repair restored physical gate from last failure"
                 UpdatedAt = (Get-Date).ToString("o")
             }
@@ -402,14 +406,28 @@ function Save-AutoRepairFailureState {
                 )
             )
         )
-        $classification = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {
+        $appleUsbRebootRequired = [bool](
+            $repairLogText -match 'APPLE_USB_REBOOT_REQUIRED=True' -or
+            $repairLogText -match 'System reboot is needed to complete configuration operations' -or
+            $repairLogText -match 'exitCode=3010'
+        )
+        $classification = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart -and $appleUsbRebootRequired) {
+            "ResolutionModeTableAndHdrGateBlockedWithAppleUsbReferenceModeFailedStartAndRebootRequired"
+        }
+        elseif ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {
             "ResolutionModeTableAndHdrGateBlockedWithAppleUsbReferenceModeFailedStart"
         }
         elseif ($modeTableBlocked -and $hdrGateClosed) {
             "ResolutionModeTableAndHdrGateBlocked"
         }
+        elseif ($hdrGateBlocked -and $appleUsbReferenceModeFailedStart -and $appleUsbRebootRequired) {
+            "HdrGateBlockedWithAppleUsbReferenceModeFailedStartAndRebootRequired"
+        }
         elseif ($hdrGateBlocked -and $appleUsbReferenceModeFailedStart) {
             "HdrGateBlockedWithAppleUsbReferenceModeFailedStart"
+        }
+        elseif ($hdrGateBlocked -and $appleUsbRebootRequired) {
+            "HdrGateBlockedWithAppleUsbRebootRequired"
         }
         elseif ($hdrGateBlocked) {
             "HdrGateBlockedWithStable5K60"
@@ -439,8 +457,12 @@ function Save-AutoRepairFailureState {
             BrightnessPercent = $State.BrightnessPercent
             AppleUsb = $State.AppleUsb
             AppleUsbReferenceModeFailedStart = $appleUsbReferenceModeFailedStart
+            AppleUsbRebootRequired = $appleUsbRebootRequired
             ValidationDetail = $State.Detail
-            NextAction = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {
+            NextAction = if ($appleUsbRebootRequired -and $hdrGateClosed) {
+                "Windows reported pnputil 3010/reboot-required while rebuilding the Apple USB control interface. Preserve 5K60/brightness, stop HDR identity rollback, and retry only after reboot, resume, or a full Thunderbolt/USB physical re-enumeration."
+            }
+            elseif ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {
                 "Do not keep sending HDR packets against this state. Preserve the current visible desktop, then use a fresh Boot Camp-style USB4/router re-enumeration on the next physical reconnect or controlled repair round; verify 5K60 mode table first, then HDR."
             }
             elseif ($modeTableBlocked -and $hdrGateClosed) {

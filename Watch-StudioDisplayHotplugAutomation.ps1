@@ -3,6 +3,7 @@ param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "StudioDisplayTools\StudioDisplayManager"),
     [int]$DurationMinutes = 20,
     [int]$PollSeconds = 3,
+    [int]$CompletionQuietSeconds = 75,
     [switch]$ExitAfterTaskCompletes,
     [string]$RunLabel = "passive hot-plug observer",
     [string]$TaskName = "Studio Display XDR Win Controller Auto Repair"
@@ -73,6 +74,7 @@ $script:lastStage = "observer-started"
 $script:sawTaskRunning = $false
 $script:lastTaskState = $null
 $script:lastLogWriteAt = Get-Date
+$script:lastAnyLogReadAt = Get-Date
 $script:lastSnapshotAt = [DateTime]::MinValue
 $script:lastStallEventAt = [DateTime]::MinValue
 $script:lastUserOverlapAt = [DateTime]::MinValue
@@ -190,6 +192,7 @@ function Read-NewLogLines {
             return @()
         }
 
+        $script:lastAnyLogReadAt = Get-Date
         return @($text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
     catch {
@@ -260,6 +263,23 @@ function Get-TaskState {
     }
 
     return [pscustomobject]$state
+}
+
+function Test-StudioDisplayRepairProcessRunning {
+    try {
+        $processes = @(
+            Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object {
+                    $_.ProcessId -ne $PID -and
+                    $_.CommandLine -match 'Repair-StudioDisplayIntegrated|Repair-StudioDisplayHdrIdentityRollback|Repair-StudioDisplayAppleUsbInterfaces|Refresh-StudioDisplayXdrLink|Install-StudioDisplayBootCampStyleMonitorDriver'
+                }
+        )
+
+        return [bool]($processes.Count -gt 0)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-UserActivityState {
@@ -463,6 +483,9 @@ function Classify-LogLine {
     elseif ($Line -match 'CM_PROB_FAILED_START.*(MI_08|MI_09)|(MI_08|MI_09).*(CM_PROB_FAILED_START)') {
         $issue = "AppleUsbMi08Mi09FailedStart"
     }
+    elseif ($Line -match 'APPLE_USB_REBOOT_REQUIRED=True|System reboot is needed to complete configuration operations|exitCode=3010') {
+        $issue = "AppleUsbRestartRequiresReboot"
+    }
     elseif ($Line -match 'Apple USB interface repair finished with unresolved failed interfaces') {
         $issue = "AppleUsbReferenceModeStillFailedAfterRestart"
     }
@@ -579,6 +602,7 @@ function Write-FinalSummary {
         RunLabel = $RunLabel
         InstallRoot = $installRoot
         Jsonl = $jsonlPath
+        CompletionQuietSeconds = $CompletionQuietSeconds
         LastStage = $script:lastStage
         SawTaskRunning = $script:sawTaskRunning
         Task = $task
@@ -605,6 +629,7 @@ function Write-FinalSummary {
             "Treat desktop 5K with a 1080p/low enumerated mode table as degraded until 5K60 is enumerated.",
             "Treat WCG as not HDR; never record WCG as code=0.",
             "When Boot Camp-style MS_0001 is ready but HighDynamicRangeSupported=False, classify the active failure as an HDR capability gate, not brightness conflict.",
+            "If pnputil returns 3010 while restarting the Apple USB composite/upstream parent, classify the round as reboot-required and skip HDR identity rollback until reboot/resume/full re-enumeration.",
             "If MI_08/MI_09 remain CM_PROB_FAILED_START while HDR is still inactive/unsupported, back off repeated HDR packets and record the USB/reference-mode gate for the next reconnect.",
             "If MI_08/MI_09 remain failed but 5K60, HDR active, and brightness HID all validate, record them as non-fatal diagnostics instead of blocking code=0.",
             "If current desktop is 5K but 5K60 is absent from the enumerated mode table, classify the round as a mode-table/link failure before blaming HDR.",
@@ -634,6 +659,8 @@ Write-ObserverEvent -Kind "observer" -Stage "observer-started" -Message "Passive
 
 $deadline = (Get-Date).AddMinutes($DurationMinutes)
 $completedAfterRunning = $false
+$completedAfterQuiet = $false
+$taskLeftRunningAt = [DateTime]::MinValue
 
 try {
     while ((Get-Date) -lt $deadline) {
@@ -658,9 +685,32 @@ try {
             $script:lastSnapshotAt = Get-Date
             $task = Write-Snapshot
             if ($ExitAfterTaskCompletes -and $script:sawTaskRunning -and $task.State -notmatch 'Running') {
-                $completedAfterRunning = $true
-                Write-ObserverEvent -Kind "complete" -Stage $script:lastStage -Message "Observed task leave Running state." -Data $task
-                break
+                if (-not $completedAfterRunning) {
+                    $completedAfterRunning = $true
+                    $taskLeftRunningAt = Get-Date
+                    Write-ObserverEvent -Kind "complete" -Stage $script:lastStage -Message "Observed task leave Running state; waiting for repair logs to become quiet before writing summary." -Data $task
+                }
+
+                $now = Get-Date
+                $latestActivityAt = $script:lastAnyLogReadAt
+                if ($script:lastLogWriteAt -gt $latestActivityAt) {
+                    $latestActivityAt = $script:lastLogWriteAt
+                }
+                if ($taskLeftRunningAt -gt $latestActivityAt) {
+                    $latestActivityAt = $taskLeftRunningAt
+                }
+
+                $quietSeconds = ($now - $latestActivityAt).TotalSeconds
+                $repairProcessRunning = Test-StudioDisplayRepairProcessRunning
+                if ($quietSeconds -ge $CompletionQuietSeconds -and -not $repairProcessRunning) {
+                    $completedAfterQuiet = $true
+                    Write-ObserverEvent -Kind "complete" -Stage $script:lastStage -Message "Observed task complete and repair logs quiet for $([int]$quietSeconds)s." -Data @{
+                        Task = $task
+                        QuietSeconds = [math]::Round($quietSeconds, 1)
+                        CompletionQuietSeconds = $CompletionQuietSeconds
+                    }
+                    break
+                }
             }
         }
 
@@ -668,7 +718,15 @@ try {
     }
 }
 finally {
-    $finishReason = if ($completedAfterRunning) { "task-completed" } else { "timeout-or-stopped" }
+    $finishReason = if ($completedAfterQuiet) {
+        "task-completed-after-log-quiescence"
+    }
+    elseif ($completedAfterRunning) {
+        "task-completed-but-log-quiescence-timeout"
+    }
+    else {
+        "timeout-or-stopped"
+    }
     Write-FinalSummary -Reason $finishReason
     Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
 }

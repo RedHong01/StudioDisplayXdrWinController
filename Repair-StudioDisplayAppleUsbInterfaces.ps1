@@ -10,6 +10,8 @@ $ErrorActionPreference = "Continue"
 
 $appleDisplayUsbPattern = 'VID_05AC&PID_1114|VID_05AC&PID_1116'
 $powershellExe = if (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe")) { Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe" } else { Join-Path $PSHOME "powershell.exe" }
+$usbRepairRebootRequiredExitCode = 6
+$script:appleUsbRebootRequired = $false
 
 function Write-UsbRepairLog {
     param([string]$Message)
@@ -137,7 +139,33 @@ function Invoke-PnpRestart {
     }
 
     Write-UsbRepairLog "Restart result for ${Label} $InstanceId`: exitCode=$exitCode"
+    $outputText = ($output -join "`n")
+    if ($exitCode -eq 3010 -or $outputText -match 'System reboot is needed to complete configuration operations') {
+        $script:appleUsbRebootRequired = $true
+        Write-UsbRepairLog "APPLE_USB_REBOOT_REQUIRED=True label='$Label' instanceId='$InstanceId' exitCode=$exitCode"
+    }
+
     return $exitCode
+}
+
+function Stop-IfAppleUsbRebootRequired {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    if (-not $script:appleUsbRebootRequired) {
+        return
+    }
+
+    Write-UsbRepairLog "Apple USB interface repair stopped after $Context because Windows reported pnputil 3010/reboot-required. Further child/composite/upstream restarts are deferred until a reboot, resume, or full Thunderbolt/USB physical re-enumeration."
+    $current = @(Get-AppleDisplayUsbDeviceState)
+    if ($current.Count -gt 0) {
+        Write-UsbRepairLog "Apple USB interface state at reboot-required stop:"
+        Write-AppleUsbDeviceTable -Devices $current
+    }
+
+    exit $usbRepairRebootRequiredExitCode
 }
 
 function Invoke-PnpScanAndSettle {
@@ -237,6 +265,7 @@ foreach ($device in $targets) {
         $restartFailures++
     }
 }
+Stop-IfAppleUsbRebootRequired -Context "direct interface restart"
 
 Start-Sleep -Seconds 3
 $after = @(Get-AppleDisplayUsbDeviceState)
@@ -266,6 +295,7 @@ if ($remainingFailures.Count -gt 0) {
                 $restartFailures++
             }
         }
+        Stop-IfAppleUsbRebootRequired -Context "composite parent restart"
 
         Invoke-PnpScanAndSettle -Seconds 8
         $after = @(Get-AppleDisplayUsbDeviceState)
@@ -290,6 +320,7 @@ if ($remainingFailures.Count -gt 0) {
                 $restartFailures++
             }
         }
+        Stop-IfAppleUsbRebootRequired -Context "upstream Apple USB parent restart"
 
         Invoke-PnpScanAndSettle -Seconds 12
         $after = @(Get-AppleDisplayUsbDeviceState)

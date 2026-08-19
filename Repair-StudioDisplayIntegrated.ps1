@@ -1354,6 +1354,20 @@ function Format-HdrRuntimeState {
     return "active=$($State.HdrActive), supported=$($State.HdrSupported), unsupported=$($State.HdrUnsupported), wcg=$($State.WcgActive)"
 }
 
+function Test-AppleUsbRepairRebootRequired {
+    param([object]$Result)
+
+    if (-not $Result) {
+        return $false
+    }
+
+    $outputText = (@($Result.Output) -join "`n")
+    return [bool](
+        [int]$Result.ExitCode -in @(6, 3010) -or
+        $outputText -match 'APPLE_USB_REBOOT_REQUIRED=True|System reboot is needed to complete configuration operations|exitCode=3010'
+    )
+}
+
 function Write-AppleDisplayUsbProblemSummary {
     try {
         $problemDevices = @(
@@ -1518,6 +1532,7 @@ $brightnessState = $null
 $shouldValidateBrightness = $false
 $hdrRepairFailed = $false
 $brightnessValidationFailed = $false
+$appleUsbRepairRequiresReboot = $false
 
 try {
     $initialState = Invoke-RepairStage -Label "Initial resolution state probe" -ScriptBlock { Get-ResolutionLadderState }
@@ -1621,8 +1636,12 @@ try {
 
         if ($needsAppleUsbRepair) {
             $appleUsbRepair = Invoke-RepairStage -Label "Apple USB/HID interface repair gate" -ScriptBlock { Invoke-AppleUsbInterfaceRepair }
+            $appleUsbRepairRequiresReboot = Test-AppleUsbRepairRebootRequired -Result $appleUsbRepair
             if ($appleUsbRepair.ExitCode -ne 0) {
                 Write-RepairLog "Apple USB/HID interface repair returned exit code $($appleUsbRepair.ExitCode). HDR will still be attempted when needed, but Windows may keep HighDynamicRangeSupported=False until the failed XDR USB control interface is fixed."
+            }
+            if ($appleUsbRepairRequiresReboot) {
+                Write-RepairLog "Apple USB/HID interface repair reported APPLE_USB_REBOOT_REQUIRED. Skipping disruptive HDR identity rollback and SET_HDR_STATE for this pass; retry after reboot, resume, or a full Thunderbolt/USB physical re-enumeration."
             }
             $hdrStateAfterAppleUsbRepair = Invoke-RepairStage -Label "HDR preflight after Apple USB/HID repair" -ScriptBlock { Get-HdrRuntimeState }
             Write-RepairLog "HDR state after Apple USB/HID repair: $(Format-HdrRuntimeState -State $hdrStateAfterAppleUsbRepair)"
@@ -1632,18 +1651,23 @@ try {
         }
 
         if ($hdrStateAfterAppleUsbRepair.HdrUnsupported -and -not $hdrStateAfterAppleUsbRepair.HdrActive) {
-            Write-RepairLog "HDR gate is still closed after Apple USB/HID repair. Running guarded HDR identity rollback once: test APPA/Generic PnP HDR-capable identity, then restore Boot Camp-style 5K60 fallback automatically if HDR does not open."
-            $identityRollback = Invoke-RepairStage -Label "HDR identity rollback gate" -ScriptBlock { Invoke-HdrIdentityRollbackRepair }
-            if ($identityRollback.ExitCode -ne 0) {
-                Write-RepairLog "HDR identity rollback returned exit code $($identityRollback.ExitCode). Continuing to final validation; success still requires ActiveColorMode=HDR."
+            if ($appleUsbRepairRequiresReboot) {
+                Write-RepairLog "HDR gate is still closed, but Apple USB parent reconfiguration is reboot-required. HDR identity rollback is intentionally skipped because monitor-INF churn cannot reopen HighDynamicRangeSupported=False while USB configuration is pending."
             }
+            else {
+                Write-RepairLog "HDR gate is still closed after Apple USB/HID repair. Running guarded HDR identity rollback once: test APPA/Generic PnP HDR-capable identity, then restore Boot Camp-style 5K60 fallback automatically if HDR does not open."
+                $identityRollback = Invoke-RepairStage -Label "HDR identity rollback gate" -ScriptBlock { Invoke-HdrIdentityRollbackRepair }
+                if ($identityRollback.ExitCode -ne 0) {
+                    Write-RepairLog "HDR identity rollback returned exit code $($identityRollback.ExitCode). Continuing to final validation; success still requires ActiveColorMode=HDR."
+                }
 
-            $hdrStateAfterAppleUsbRepair = Invoke-RepairStage -Label "HDR preflight after identity rollback" -ScriptBlock { Get-HdrRuntimeState }
-            Write-RepairLog "HDR state after identity rollback: $(Format-HdrRuntimeState -State $hdrStateAfterAppleUsbRepair)"
-            $postIdentityResolutionState = Invoke-RepairStage -Label "Resolution probe after identity rollback" -ScriptBlock { Get-ResolutionLadderState }
-            Write-RepairLog "Resolution state after identity rollback: $($postIdentityResolutionState.Summary)"
-            if ($postIdentityResolutionState.HasCurrent5K -or $postIdentityResolutionState.Has5K60Enumerated) {
-                $postRefreshState = $postIdentityResolutionState
+                $hdrStateAfterAppleUsbRepair = Invoke-RepairStage -Label "HDR preflight after identity rollback" -ScriptBlock { Get-HdrRuntimeState }
+                Write-RepairLog "HDR state after identity rollback: $(Format-HdrRuntimeState -State $hdrStateAfterAppleUsbRepair)"
+                $postIdentityResolutionState = Invoke-RepairStage -Label "Resolution probe after identity rollback" -ScriptBlock { Get-ResolutionLadderState }
+                Write-RepairLog "Resolution state after identity rollback: $($postIdentityResolutionState.Summary)"
+                if ($postIdentityResolutionState.HasCurrent5K -or $postIdentityResolutionState.Has5K60Enumerated) {
+                    $postRefreshState = $postIdentityResolutionState
+                }
             }
         }
 
@@ -1652,7 +1676,12 @@ try {
         }
         elseif ($hdrStateAfterAppleUsbRepair.HdrUnsupported) {
             $hdrRepairFailed = $true
-            Write-RepairLog "HDR state repair skipped because Windows still reports HighDynamicRangeSupported=False after Apple USB/HID repair. SET_HDR_STATE cannot open this capability gate; final validation will keep exit code non-zero without spending another packet/diagnostic cycle."
+            if ($appleUsbRepairRequiresReboot) {
+                Write-RepairLog "HDR state repair skipped because Windows still reports HighDynamicRangeSupported=False and Apple USB repair is reboot-required. SET_HDR_STATE cannot open this capability gate until Windows completes USB device configuration."
+            }
+            else {
+                Write-RepairLog "HDR state repair skipped because Windows still reports HighDynamicRangeSupported=False after Apple USB/HID repair. SET_HDR_STATE cannot open this capability gate; final validation will keep exit code non-zero without spending another packet/diagnostic cycle."
+            }
         }
         else {
             $hdrRepair = Invoke-RepairStage -Label "HDR state repair gate" -ScriptBlock { Invoke-HdrRepair -RestoreWcgFallback:([bool]$hdrStateAfterAppleUsbRepair.HdrUnsupported) }
