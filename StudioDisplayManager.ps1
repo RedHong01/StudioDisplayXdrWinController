@@ -846,6 +846,20 @@ function Get-StudioDisplayLastFailureState {
     }
 }
 
+function Clear-StudioDisplayLastFailureState {
+    param([string]$Reason = "automatic")
+
+    try {
+        if (Test-Path -LiteralPath $lastFailureStateFile) {
+            Remove-Item -LiteralPath $lastFailureStateFile -Force -ErrorAction SilentlyContinue
+            Write-AppLog "Cleared stale Studio Display last failure state for $Reason."
+        }
+    }
+    catch {
+        Write-AppLog "Could not clear Studio Display last failure state for $Reason`: $($_.Exception.Message)"
+    }
+}
+
 function Test-StudioDisplayFailureNeedsPhysicalReenumeration {
     param([object]$FailureState)
 
@@ -3110,6 +3124,7 @@ try {
                     $script:hdrActiveResolutionSettleUntil = [DateTime]::MinValue
                     Reset-StudioDisplayResolutionModeTableBlock -Reason $repairReason
                     Reset-StudioDisplayHdrGateBlock -Reason $repairReason
+                    Clear-StudioDisplayLastFailureState -Reason "$repairReason physical re-enumeration observed"
                 }
                 elseif ($repairDueToTopologyChange) {
                     $script:lastHdrActivationAt = [DateTime]::MinValue
@@ -3147,6 +3162,7 @@ try {
             $script:hdrActiveResolutionSettleUntil = [DateTime]::MinValue
             Reset-StudioDisplayResolutionModeTableBlock -Reason "Studio Display disconnected"
             Reset-StudioDisplayHdrGateBlock -Reason "Studio Display disconnected"
+            Clear-StudioDisplayLastFailureState -Reason "Studio Display disconnected"
         }
 
         $script:lastStudioDisplayConnected = $studioDisplayConnected

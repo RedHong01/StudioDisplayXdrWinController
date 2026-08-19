@@ -215,6 +215,9 @@ $results.Add((Test-FileContains -Path $integratedRepair -Pattern 'HDR identity r
 $results.Add((Test-FileContains -Path $integratedRepair -Pattern 'Existing Apple USB reboot-required HDR gate is active' -Name "guard:persisted-apple-usb-gate-skip" -Detail "persisted reboot-required gate skips repeated USB repair")) | Out-Null
 $results.Add((Test-FileContains -Path $integratedRepair -Pattern 'Apple USB/HID interface repair skipped because \$appleUsbRepairSkipReason' -Name "guard:accurate-apple-usb-skip-reason" -Detail "skip logging preserves the true gate reason")) | Out-Null
 $results.Add((Test-FileContains -Path $watcher -Pattern 'skipped because an existing Apple USB reboot-required HDR gate is active' -Name "guard:observer-classifies-persisted-gate-skip" -Detail "observer classifies persisted gate skips as reboot-required")) | Out-Null
+$results.Add((Test-FileContains -Path $manager -Pattern 'Clear-StudioDisplayLastFailureState' -Name "guard:clear-stale-last-failure-function" -Detail "manager can clear stale failure evidence after physical re-enumeration")) | Out-Null
+$results.Add((Test-FileContains -Path $manager -Pattern 'physical re-enumeration observed' -Name "guard:reconnect-invalidates-stale-last-failure" -Detail "reconnect path invalidates stale Apple USB reboot-required failures before retry")) | Out-Null
+$results.Add((Test-FileContains -Path $manager -Pattern 'Studio Display disconnected' -Name "guard:disconnect-invalidates-stale-last-failure" -Detail "disconnect path invalidates stale Apple USB reboot-required failures")) | Out-Null
 
 $maintenanceStatePath = Join-Path $InstallRoot "StudioDisplayAutomationMaintenanceState.json"
 $maintenanceState = Read-JsonFile -Path $maintenanceStatePath
