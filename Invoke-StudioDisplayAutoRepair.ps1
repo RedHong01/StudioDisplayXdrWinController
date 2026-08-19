@@ -198,6 +198,30 @@ function Save-AutoRepairMaintenanceState {
     }
 }
 
+function Clear-AutoRepairStaleMaintenanceStateAfterBoot {
+    param([string]$Reason = "automatic")
+
+    if (-not (Test-Path -LiteralPath $automationMaintenanceStateFile)) {
+        return $false
+    }
+
+    try {
+        $maintenanceState = Get-Content -LiteralPath $automationMaintenanceStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $updatedAt = Get-AutoRepairStateUpdatedAt -State $maintenanceState
+        $bootTime = Get-AutoRepairSystemBootTime
+        if ($bootTime -gt [DateTime]::MinValue -and $updatedAt -gt [DateTime]::MinValue -and $updatedAt -lt $bootTime) {
+            Remove-Item -LiteralPath $automationMaintenanceStateFile -Force -ErrorAction SilentlyContinue
+            Write-AutoRepairLog "Cleared stale Studio Display automation maintenance state because the machine rebooted after it was recorded. reason=$Reason updatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))"
+            return $true
+        }
+    }
+    catch {
+        Write-AutoRepairLog "Could not evaluate stale automation maintenance state for $Reason`: $($_.Exception.Message)"
+    }
+
+    return $false
+}
+
 function Test-AutoRepairRepairLogMarksAppleUsbRebootRequired {
     param([string]$RepairLogText)
 
@@ -833,6 +857,7 @@ if ($ValidateOnly) {
 }
 
 Write-AutoRepairLog "Scheduled auto repair started. Reason=$Reason Log=$logPath"
+Clear-AutoRepairStaleMaintenanceStateAfterBoot -Reason $Reason | Out-Null
 
 if (-not (Test-Path -LiteralPath $integratedRepairScript)) {
     Write-AutoRepairLog "Integrated repair script is missing: $integratedRepairScript"

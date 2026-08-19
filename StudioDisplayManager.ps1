@@ -1072,6 +1072,31 @@ function Save-StudioDisplayAutomationMaintenanceState {
     }
 }
 
+function Clear-StudioDisplayStaleAutomationMaintenanceStateAfterBoot {
+    param([string]$Reason = "automatic")
+
+    if (-not (Test-Path -LiteralPath $automationMaintenanceStateFile)) {
+        return $false
+    }
+
+    try {
+        $maintenanceState = Get-Content -LiteralPath $automationMaintenanceStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $updatedAt = [DateTime]::MinValue
+        [void][DateTime]::TryParse([string]$maintenanceState.UpdatedAt, [ref]$updatedAt)
+        $bootTime = Get-StudioDisplaySystemBootTime
+        if ($bootTime -gt [DateTime]::MinValue -and $updatedAt -gt [DateTime]::MinValue -and $updatedAt -lt $bootTime) {
+            Remove-Item -LiteralPath $automationMaintenanceStateFile -Force -ErrorAction SilentlyContinue
+            Write-AppLog "Cleared stale Studio Display automation maintenance state for $Reason because the machine rebooted after it was recorded. updatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))"
+            return $true
+        }
+    }
+    catch {
+        Write-AppLog "Could not evaluate stale automation maintenance state for $Reason`: $($_.Exception.Message)"
+    }
+
+    return $false
+}
+
 function Test-StudioDisplayConnected {
     try {
         $studioDisplay = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop |
@@ -2829,6 +2854,7 @@ $lastBrightnessServiceRecoveryAttemptAt = [DateTime]::MinValue
 
 Restore-StudioDisplayHdrGateBlockState -Reason "tray startup"
 Restore-StudioDisplayResolutionModeTableBlockState -Reason "tray startup"
+$staleMaintenanceClearedAfterBoot = Clear-StudioDisplayStaleAutomationMaintenanceStateAfterBoot -Reason "tray startup"
 
 try {
     $runningIcon = New-StatusIcon -Color ([System.Drawing.Color]::FromArgb(60, 179, 113))
@@ -3341,6 +3367,9 @@ try {
     if ($startupStudioDisplayConnected) {
         $script:lastDisplayRepairAt = Get-Date
         $script:pendingHdrRepair = $true
+        if ($staleMaintenanceClearedAfterBoot) {
+            Save-StudioDisplayAutomationMaintenanceState -Stage "PostRebootRecoveryProbe" -Action "ProbeAndRecover" -Detail "Windows restarted after a previous Studio Display Apple USB 3010 gate; stale maintenance/failure gates were cleared and the controller is probing 5K/HDR/brightness again."
+        }
         Save-StudioDisplayPipelineDecision -Reason "tray startup HDR restore" -Stage "StartupProbe" -Action "ProbeAndDecide" -Detail "The tray started while Studio Display evidence is present; probing current gates before deciding whether to rebuild."
         Start-StudioDisplayPassiveHotplugObserver -Reason "tray startup HDR restore" | Out-Null
         $startupRepairReady = Invoke-StudioDisplayHdrActivation -Reason "tray startup HDR restore" -Automatic
