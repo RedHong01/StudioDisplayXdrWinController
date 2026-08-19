@@ -859,6 +859,41 @@ function Get-StudioDisplaySystemBootTime {
     return [DateTime]::MinValue
 }
 
+function Get-StudioDisplayPhysicalReenumerationMarker {
+    if (-not (Test-Path -LiteralPath $physicalReenumerationStateFile)) {
+        return $null
+    }
+
+    try {
+        $marker = Get-Content -LiteralPath $physicalReenumerationStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $updatedAt = [DateTime]::MinValue
+        [void][DateTime]::TryParse([string]$marker.UpdatedAt, [ref]$updatedAt)
+        if ($updatedAt -eq [DateTime]::MinValue) {
+            return $null
+        }
+
+        $bootTime = Get-StudioDisplaySystemBootTime
+        if ($bootTime -gt [DateTime]::MinValue -and $updatedAt -lt $bootTime) {
+            return $null
+        }
+
+        $event = [string]$marker.Event
+        if ($event -notmatch 'Disconnected|Reconnected|PowerResume|HdrGateOpened') {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            UpdatedAt = $updatedAt
+            Event = $event
+            Reason = [string]$marker.Reason
+        }
+    }
+    catch {
+        Write-AppLog "Could not read Studio Display physical re-enumeration marker: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Get-StudioDisplayLastFailureState {
     if (-not (Test-Path -LiteralPath $lastFailureStateFile)) {
         return $null
@@ -872,6 +907,25 @@ function Get-StudioDisplayLastFailureState {
         if ($bootTime -gt [DateTime]::MinValue -and $updatedAt -gt [DateTime]::MinValue -and $updatedAt -lt $bootTime) {
             Write-AppLog "Ignoring stale Studio Display failure state from before current boot. UpdatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))."
             return $null
+        }
+
+        $marker = Get-StudioDisplayPhysicalReenumerationMarker
+        $markerNearFailure = [bool](
+            $marker -and
+            (
+                $updatedAt -eq [DateTime]::MinValue -or
+                [Math]::Abs(($updatedAt - $marker.UpdatedAt).TotalMinutes) -le 30 -or
+                $marker.UpdatedAt -gt $updatedAt
+            )
+        )
+        if ([bool]$failureState.AppleUsbRebootRequired -and $markerNearFailure) {
+            $failureState | Add-Member -NotePropertyName WindowsRestartRequired -NotePropertyValue $true -Force
+            $failureState | Add-Member -NotePropertyName PhysicalReenumerationAlreadyObserved -NotePropertyValue $true -Force
+            $failureState | Add-Member -NotePropertyName PhysicalReenumerationMarker -NotePropertyValue ([pscustomobject]@{
+                UpdatedAt = $marker.UpdatedAt.ToString("o")
+                Event = [string]$marker.Event
+                Reason = [string]$marker.Reason
+            }) -Force
         }
 
         return $failureState

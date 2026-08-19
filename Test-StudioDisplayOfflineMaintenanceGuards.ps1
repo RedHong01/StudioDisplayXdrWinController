@@ -243,6 +243,7 @@ $results.Add((Test-FileContains -Path $manager -Pattern 'HdrGateOpened' -Name "g
 $results.Add((Test-FileContains -Path $manager -Pattern 'Clear-StudioDisplayLastFailureState -Reason \$hdrOpenedGateReason' -Name "guard:hdr-open-during-settle-clears-last-failure" -Detail "HDR visible during 5K mode-table settle clears stale Apple USB 3010 failure evidence")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Disconnected\|Reconnected\|PowerResume\|HdrGateOpened' -Name "guard:auto-repair-accepts-hdr-open-marker" -Detail "auto repair treats transient HDR-open evidence as a fresh marker that can invalidate stale gates")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'WindowsRestartRequired' -Name "guard:auto-repair-classifies-reboot-after-physical-marker" -Detail "Apple USB 3010 after physical re-enumeration is classified as waiting for Windows restart, not more hot-plug loops")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'physicalMarkerNearFailure' -Name "guard:auto-repair-migrates-legacy-3010-gate" -Detail "legacy Apple USB 3010 states are upgraded when a nearby physical re-enumeration marker exists")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'HdrGateWaitingForWindowsRestart' -Name "guard:manager-reports-windows-restart-gate" -Detail "manager reports a distinct Windows restart gate after physical re-enumeration has already been tried")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'SkipUntilWindowsRestart' -Name "guard:auto-repair-skips-until-windows-restart" -Detail "scheduled repair does not repeat disruptive deep repair after Apple USB 3010 survives physical re-enumeration")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'Restore-BrightnessServicesWhenSafe' -Name "guard:manager-restores-brightness-after-stale-repair" -Detail "manager restarts brightness workers after a stalled/non-active repair releases the display pipeline")) | Out-Null
@@ -281,8 +282,9 @@ if ($maintenanceState) {
         $maintenanceState.Failure.AppleUsbRebootRequired -or
         (Test-RepairLogMarksAppleUsbRebootRequired -Path $failureRepairLog)
     )
+    $safeHoldStages = @("HdrGateWaitingForPhysicalReenumeration", "HdrGateWaitingForWindowsRestart")
     $gateIsSafe = [bool](
-        $maintenanceState.Stage -eq "HdrGateWaitingForPhysicalReenumeration" -and
+        ($safeHoldStages -contains [string]$maintenanceState.Stage) -and
         $maintenanceState.RequiresPhysicalReenumeration -and
         $maintenanceState.Resolution.Current5K -and
         $maintenanceState.Resolution.FiveK60Enumerated -and
@@ -290,10 +292,10 @@ if ($maintenanceState) {
         -not $maintenanceState.Hdr.HdrActive -and
         $failureRebootRequired
     )
-    $results.Add((New-GuardResult -Name "runtime:physical-gate-preserves-5k60" -Passed $gateIsSafe -Detail "maintenance state is waiting for physical re-enumeration while preserving 5K60" -Data $maintenanceState)) | Out-Null
+    $results.Add((New-GuardResult -Name "runtime:physical-or-restart-gate-preserves-5k60" -Passed $gateIsSafe -Detail "maintenance state is waiting for safe physical/restart recovery while preserving 5K60" -Data $maintenanceState)) | Out-Null
 }
 else {
-    $results.Add((New-GuardResult -Name "runtime:physical-gate-preserves-5k60" -Passed $false -Detail "maintenance state missing" -Data @{ Path = $maintenanceStatePath })) | Out-Null
+    $results.Add((New-GuardResult -Name "runtime:physical-or-restart-gate-preserves-5k60" -Passed $false -Detail "maintenance state missing" -Data @{ Path = $maintenanceStatePath })) | Out-Null
 }
 
 $brightnessWorkersReady = [bool]($managerPid.Running -and $mirrorPid.Running -and $bridgePid.Running)

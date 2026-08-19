@@ -372,11 +372,21 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             -not $State.HdrSupported -and
             -not $State.HdrActive
         )
+        $physicalMarkerForGate = Get-AutoRepairPhysicalReenumerationMarker
+        $lastFailureUpdatedAt = Get-AutoRepairStateUpdatedAt -State $lastFailure
+        $physicalMarkerNearFailure = [bool](
+            $physicalMarkerForGate -and
+            (
+                $lastFailureUpdatedAt -eq [DateTime]::MinValue -or
+                [Math]::Abs(($lastFailureUpdatedAt - $physicalMarkerForGate.UpdatedAt).TotalMinutes) -le 30 -or
+                $physicalMarkerForGate.UpdatedAt -gt $lastFailureUpdatedAt
+            )
+        )
         $restartOnlyGate = [bool](
             $lastFailure -and
             (
                 [bool]$lastFailure.WindowsRestartRequired -or
-                ([bool]$lastFailure.AppleUsbRebootRequired -and [bool]$lastFailure.PhysicalReenumerationAlreadyObserved)
+                ([bool]$lastFailure.AppleUsbRebootRequired -and ([bool]$lastFailure.PhysicalReenumerationAlreadyObserved -or $physicalMarkerNearFailure))
             )
         )
 
