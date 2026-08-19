@@ -377,6 +377,17 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             Save-AutoRepairMaintenanceState -Stage "HdrGateWaitingForPhysicalReenumeration" -Action "SkipDeepRepair" -Detail "Preflight still matches the last HDR physical gate: 5K60 is stable, but HighDynamicRangeSupported=False." -State $State -GateState $gateState
             return $true
         }
+
+        $persistedAppleUsbRebootGate = [bool](
+            [bool]$gateState.AppleUsbRebootRequired -or
+            ($lastFailure -and [bool]$lastFailure.AppleUsbRebootRequired) -or
+            $lastFailureLogMarksRebootRequired
+        )
+        if ($persistedAppleUsbRebootGate) {
+            Save-AutoRepairMaintenanceState -Stage "HdrGateWaitingForPhysicalReenumeration" -Action "SkipDeepRepair" -Detail "Persisted Apple USB reboot-required gate is active. Skipping deep repair until reboot, resume, or full Thunderbolt/USB physical re-enumeration even if the current probe is partially degraded." -State $State -GateState $gateState
+            Write-AutoRepairLog "Skipped disruptive repair because the persisted Apple USB reboot-required physical gate is still active and HDR support is not visible."
+            return $true
+        }
     }
     catch {
         Write-AutoRepairLog "Could not evaluate HDR physical re-enumeration gate: $($_.Exception.Message)"

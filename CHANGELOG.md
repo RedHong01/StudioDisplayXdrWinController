@@ -29,6 +29,9 @@
 - Preserved existing last-failure evidence while the HDR physical re-enumeration
   gate is active, so a preflight-only skip cannot erase the repair log that
   explains why the controller is waiting.
+- Blocked deep repair directly from a persisted Apple USB reboot-required gate
+  even when a transient probe is partially degraded, preventing direct launcher
+  calls from surfacing UAC/elevation prompts while the controller is waiting.
 - Installed `HdrScreenshotGuard.ps1` and the offline maintenance guard through
   the release installer so fresh GitHub clones match the local running
   controller component set.

@@ -247,6 +247,7 @@ $results.Add((Test-FileContains -Path $integratedRepair -Pattern 'repair log con
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Wait-AutoRepairRepairLogQuiet' -Name "guard:auto-repair-waits-for-late-usb-evidence" -Detail "failure state is saved only after timed-out Apple USB logs settle")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Preserved existing Studio Display last failure state' -Name "guard:auto-repair-preserves-last-failure-evidence" -Detail "physical-gate skips do not overwrite repair-log evidence with a preflight-only snapshot")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Upgraded existing Studio Display last failure state to AppleUsbRebootRequired=True' -Name "guard:auto-repair-upgrades-last-failure-from-log-3010" -Detail "legacy false reboot-required state can be corrected from repair-log 3010 evidence")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'persisted Apple USB reboot-required physical gate is still active' -Name "guard:auto-repair-persisted-3010-gate-blocks-deep-repair" -Detail "persisted Apple USB 3010 gate blocks deep repair even when the current probe is partially degraded")) | Out-Null
 
 $maintenanceStatePath = Join-Path $InstallRoot "StudioDisplayAutomationMaintenanceState.json"
 $maintenanceState = Read-JsonFile -Path $maintenanceStatePath
