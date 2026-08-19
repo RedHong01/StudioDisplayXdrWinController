@@ -61,6 +61,54 @@ function Test-ObserverProcessRunning {
     }
 }
 
+function Get-ObserverKeepProcessIds {
+    $keep = @{}
+    $keep[[int]$PID] = $true
+
+    try {
+        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+        if ($current -and $current.ParentProcessId) {
+            $keep[[int]$current.ParentProcessId] = $true
+        }
+    }
+    catch {
+    }
+
+    return $keep
+}
+
+function Stop-ObserverSiblingProcesses {
+    if (-not $ReplaceExisting) {
+        return
+    }
+
+    try {
+        $keep = Get-ObserverKeepProcessIds
+        $scriptNamePattern = [regex]::Escape((Split-Path -Leaf $PSCommandPath))
+        $matches = @(
+            Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object {
+                    $_.ProcessId -and
+                    -not $keep.ContainsKey([int]$_.ProcessId) -and
+                    $_.CommandLine -match $scriptNamePattern
+                }
+        )
+
+        foreach ($match in $matches) {
+            try {
+                Stop-Process -Id ([int]$match.ProcessId) -Force -ErrorAction Stop
+                Write-Host ("[{0}] observer Replaced stale passive observer process PID {1}." -f (Get-Date -Format "HH:mm:ss"), [int]$match.ProcessId)
+            }
+            catch {
+                Write-Host ("[{0}] observer Stale passive observer process PID {1} could not be replaced: {2}" -f (Get-Date -Format "HH:mm:ss"), [int]$match.ProcessId, $_.Exception.Message)
+            }
+        }
+    }
+    catch {
+        Write-Host ("[{0}] observer Could not enumerate stale passive observer processes; falling back to PID-file singleton only: {1}" -f (Get-Date -Format "HH:mm:ss"), $_.Exception.Message)
+    }
+}
+
 function Initialize-ObserverSingleton {
     if (-not (Test-Path -LiteralPath $pidPath)) {
         return
@@ -96,6 +144,7 @@ function Initialize-ObserverSingleton {
     exit 9
 }
 
+Stop-ObserverSiblingProcesses
 Initialize-ObserverSingleton
 Set-Content -LiteralPath $pidPath -Value $PID -Encoding ascii -ErrorAction SilentlyContinue
 
