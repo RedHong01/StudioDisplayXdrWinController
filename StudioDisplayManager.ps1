@@ -919,6 +919,11 @@ function Get-StudioDisplayLastFailureState {
             )
         )
         if ([bool]$failureState.AppleUsbRebootRequired -and $markerNearFailure) {
+            $needsMigration = [bool](
+                -not [bool]$failureState.WindowsRestartRequired -or
+                -not [bool]$failureState.PhysicalReenumerationAlreadyObserved -or
+                -not ($failureState.PSObject.Properties.Name -contains "PhysicalReenumerationMarker")
+            )
             $failureState | Add-Member -NotePropertyName WindowsRestartRequired -NotePropertyValue $true -Force
             $failureState | Add-Member -NotePropertyName PhysicalReenumerationAlreadyObserved -NotePropertyValue $true -Force
             $failureState | Add-Member -NotePropertyName PhysicalReenumerationMarker -NotePropertyValue ([pscustomobject]@{
@@ -926,6 +931,14 @@ function Get-StudioDisplayLastFailureState {
                 Event = [string]$marker.Event
                 Reason = [string]$marker.Reason
             }) -Force
+            $failureState | Add-Member -NotePropertyName NextAction -NotePropertyValue "Windows reported pnputil 3010/reboot-required after a fresh Studio Display physical re-enumeration marker. Preserve 5K60/brightness and wait for a Windows restart or system-level USB stack reset; repeated hot-plug alone has already been tried in this boot." -Force
+
+            if ($needsMigration) {
+                $failureState |
+                    ConvertTo-Json -Depth 8 |
+                    Set-Content -LiteralPath $lastFailureStateFile -Encoding ascii -ErrorAction Stop
+                Write-AppLog "Migrated legacy Studio Display Apple USB 3010 failure state to WindowsRestartRequired because a nearby physical re-enumeration marker was observed."
+            }
         }
 
         return $failureState

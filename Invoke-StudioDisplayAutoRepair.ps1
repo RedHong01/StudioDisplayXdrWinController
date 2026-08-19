@@ -389,6 +389,30 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
                 ([bool]$lastFailure.AppleUsbRebootRequired -and ([bool]$lastFailure.PhysicalReenumerationAlreadyObserved -or $physicalMarkerNearFailure))
             )
         )
+        if (
+            $restartOnlyGate -and
+            $lastFailure -and
+            [bool]$lastFailure.AppleUsbRebootRequired -and
+            $physicalMarkerForGate -and
+            (
+                -not [bool]$lastFailure.WindowsRestartRequired -or
+                -not [bool]$lastFailure.PhysicalReenumerationAlreadyObserved -or
+                -not ($lastFailure.PSObject.Properties.Name -contains "PhysicalReenumerationMarker")
+            )
+        ) {
+            $lastFailure | Add-Member -NotePropertyName WindowsRestartRequired -NotePropertyValue $true -Force
+            $lastFailure | Add-Member -NotePropertyName PhysicalReenumerationAlreadyObserved -NotePropertyValue $true -Force
+            $lastFailure | Add-Member -NotePropertyName PhysicalReenumerationMarker -NotePropertyValue ([pscustomobject]@{
+                UpdatedAt = $physicalMarkerForGate.UpdatedAt.ToString("o")
+                Event = [string]$physicalMarkerForGate.Event
+                Reason = [string]$physicalMarkerForGate.Reason
+            }) -Force
+            $lastFailure | Add-Member -NotePropertyName NextAction -NotePropertyValue "Windows reported pnputil 3010/reboot-required after a fresh Studio Display physical re-enumeration marker. Preserve 5K60/brightness and wait for a Windows restart or system-level USB stack reset; repeated hot-plug alone has already been tried in this boot." -Force
+            $lastFailure |
+                ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath $lastFailureStateFile -Encoding ascii -ErrorAction SilentlyContinue
+            Write-AutoRepairLog "Migrated legacy Studio Display Apple USB 3010 failure state to WindowsRestartRequired before skipping deep repair."
+        }
 
         if ($gateStillMatches) {
             $stage = if ($restartOnlyGate) { "HdrGateWaitingForWindowsRestart" } else { "HdrGateWaitingForPhysicalReenumeration" }
