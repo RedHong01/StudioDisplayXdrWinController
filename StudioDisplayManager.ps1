@@ -88,6 +88,7 @@ $resolutionModeTableStaleBackoffSeconds = 90
 $resolutionModeTableStaleRetryLimit = 3
 $resolutionModeTableBlockedLogCooldownSeconds = 60
 $hdrActiveResolutionSettleSeconds = 30
+$brightnessServiceRecoveryCooldownSeconds = 20
 $autoRepairTaskRegistrationPromptBackoffSeconds = 1800
 $hdrScreenshotSafeSdrWhiteNits = 240
 $hdrScreenshotGuardStartBackoffSeconds = 30
@@ -578,6 +579,40 @@ function Start-BrightnessServices {
     $mirrorStarted = Start-MirrorService
     $bridgeStarted = Start-BrightnessKeyBridge
     return [bool]($mirrorStarted -and $bridgeStarted)
+}
+
+function Test-BrightnessServicesRunning {
+    $mirrorRunning = Test-BrightnessWorkerAvailable -Label "SystemBrightnessMirror" -ScriptPath $mirrorScript -PidPath $mirrorPidFile -MutexName $mirrorMutexName
+    $bridgeRunning = Test-BrightnessWorkerAvailable -Label "BrightnessKeyBridge" -ScriptPath $brightnessBridgeScript -PidPath $brightnessBridgePidFile -MutexName $brightnessBridgeMutexName
+    return [bool]($mirrorRunning -and $bridgeRunning)
+}
+
+function Restore-BrightnessServicesWhenSafe {
+    param([string]$Reason = "automatic brightness service recovery")
+
+    if (Test-BrightnessServicesRunning) {
+        return $true
+    }
+
+    if (Test-StudioDisplayDeepRepairActive) {
+        return $false
+    }
+
+    $now = Get-Date
+    if (($now - $script:lastBrightnessServiceRecoveryAttemptAt).TotalSeconds -lt $brightnessServiceRecoveryCooldownSeconds) {
+        return $false
+    }
+
+    $script:lastBrightnessServiceRecoveryAttemptAt = $now
+    $started = Start-BrightnessServices
+    if ($started) {
+        Write-AppLog "Brightness services restored for $Reason after the display pipeline was no longer actively repairing."
+    }
+    else {
+        Write-AppLog "Brightness services are still unavailable for $Reason even though no active integrated repair host was detected."
+    }
+
+    return [bool]$started
 }
 
 function Stop-BrightnessServices {
@@ -2698,6 +2733,7 @@ $lastAutoRepairTaskRegistrationPromptAt = [DateTime]::MinValue
 $lastStudioDisplayPnpCheckAt = [DateTime]::MinValue
 $lastStudioDisplayPnpCheckResult = $false
 $lastHdrScreenshotGuardStartAttemptAt = [DateTime]::MinValue
+$lastBrightnessServiceRecoveryAttemptAt = [DateTime]::MinValue
 
 Restore-StudioDisplayHdrGateBlockState -Reason "tray startup"
 Restore-StudioDisplayResolutionModeTableBlockState -Reason "tray startup"
@@ -3180,8 +3216,8 @@ try {
             Invoke-StudioDisplayHdrActivation -Reason "automatic Thunderbolt hot-plug/resume restore" -Automatic | Out-Null
         }
 
-        if ($studioDisplayConnected -and $script:hdrGateRequiresPhysicalReenumeration -and -not (Test-StudioDisplayDeepRepairActive)) {
-            Start-BrightnessServices | Out-Null
+        if ($studioDisplayConnected) {
+            Restore-BrightnessServicesWhenSafe -Reason "automatic Thunderbolt hot-plug/resume restore" | Out-Null
         }
 
         if (-not $studioDisplayConnected) {

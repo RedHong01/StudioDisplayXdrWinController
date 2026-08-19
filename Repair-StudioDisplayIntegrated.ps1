@@ -1135,7 +1135,7 @@ function Invoke-HdrCapabilityNativeIdentityRefreshIfNeeded {
     }
 
     if (-not $Apply) {
-        Write-RepairLog "Dry run: HDR is unsupported while stable 5K60 is exposed through active MS_0001; would run one non-destructive native APPA identity USB4/link refresh before Apple USB deep repair."
+        Write-RepairLog "Dry run: HDR is unsupported while stable 5K60 is exposed through active MS_0001; would run one protected Boot Camp-style monitor driver gate followed by one non-destructive native APPA identity USB4/link refresh before Apple USB deep repair."
         return & $currentResult
     }
 
@@ -1145,9 +1145,18 @@ function Invoke-HdrCapabilityNativeIdentityRefreshIfNeeded {
     }
 
     $script:nativeIdentityRefreshAttempted = $true
-    Write-RepairLog "HDR is unsupported while stable 5K60 is exposed through active MS_0001. Replaying the known-good a07bebe recovery shape: run one non-destructive monitor/router USB4 refresh to give Windows a chance to re-activate the native APPA Studio Display identity before Apple USB/HID deep repair."
+    Write-RepairLog "HDR is unsupported while stable 5K60 is exposed through active MS_0001. Replaying the exact known-good a07bebe recovery shape: run one protected Boot Camp-style monitor driver gate, then one non-destructive monitor/router USB4 refresh to give Windows a chance to re-activate the native APPA Studio Display identity before Apple USB/HID deep repair."
 
-    $afterRefreshState = Invoke-RepairStage -Label "Native APPA identity USB4/link refresh" -ScriptBlock { Invoke-LinkRefreshIfNeeded -InitialState $ResolutionState -Force }
+    $previousEnsure = $script:effectiveEnsureBootCampMonitorDriver
+    $script:effectiveEnsureBootCampMonitorDriver = $true
+    try {
+        Invoke-RepairStage -Label "Native APPA Boot Camp-style monitor driver gate" -ScriptBlock { Invoke-BootCampDriverIfRequested } | Out-Null
+        Invoke-RepairStage -Label "Boot Camp-style identity settle before native APPA refresh" -ScriptBlock { Wait-BootCampStyleMonitorIdentity -TimeoutSeconds 20 } | Out-Null
+        $afterRefreshState = Invoke-RepairStage -Label "Native APPA identity USB4/link refresh" -ScriptBlock { Invoke-LinkRefreshIfNeeded -InitialState $ResolutionState -Force }
+    }
+    finally {
+        $script:effectiveEnsureBootCampMonitorDriver = $previousEnsure
+    }
     Write-RepairLog "Resolution state after native APPA identity refresh: $($afterRefreshState.Summary)"
 
     $afterIdentityState = Invoke-RepairStage -Label "Boot Camp-style identity settle after native APPA refresh" -ScriptBlock { Wait-BootCampStyleMonitorIdentity -TimeoutSeconds 24 }

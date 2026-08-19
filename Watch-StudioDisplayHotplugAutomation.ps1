@@ -103,6 +103,11 @@ function Stop-ObserverSiblingProcesses {
                 Write-Host ("[{0}] observer Stale passive observer process PID {1} could not be replaced: {2}" -f (Get-Date -Format "HH:mm:ss"), [int]$match.ProcessId, $_.Exception.Message)
             }
         }
+
+        if ($matches.Count -gt 0) {
+            Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+            Write-Host ("[{0}] observer Cleared passive observer PID file after stale sibling replacement." -f (Get-Date -Format "HH:mm:ss"))
+        }
     }
     catch {
         Write-Host ("[{0}] observer Could not enumerate stale passive observer processes; falling back to PID-file singleton only: {1}" -f (Get-Date -Format "HH:mm:ss"), $_.Exception.Message)
@@ -134,6 +139,12 @@ function Initialize-ObserverSingleton {
             Write-Host ("[{0}] observer Replaced existing passive observer PID {1}." -f (Get-Date -Format "HH:mm:ss"), $existingPid)
         }
         catch {
+            if (-not (Test-ObserverProcessRunning -ProcessId $existingPid)) {
+                Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+                Write-Host ("[{0}] observer Cleared stale passive observer PID {1}; process already exited." -f (Get-Date -Format "HH:mm:ss"), $existingPid)
+                return
+            }
+
             Write-Host ("[{0}] observer Existing passive observer PID {1} could not be replaced: {2}" -f (Get-Date -Format "HH:mm:ss"), $existingPid, $_.Exception.Message)
             exit 9
         }
