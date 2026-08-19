@@ -123,7 +123,10 @@ powershell -ExecutionPolicy Bypass -File .\Install-StudioDisplayTools.ps1 `
   Offline maintenance guard audit. It verifies source/installed script hashes,
   parser health, persisted HDR-gate behavior, brightness workers, and latest
   observer stability so the controller can be maintained without destructive
-  monitor-identity churn.
+  monitor-identity churn. The guard also verifies that true Studio Display
+  disconnect/reconnect/resume events are persisted as a physical re-enumeration
+  marker so stale Apple USB reboot-required gates do not block the next offline
+  repair pass.
 - `Watch-StudioDisplayHotplugAutomation.ps1`
   Passive hot-plug observer. It records the current repair stage, task state,
   5K mode table, HDR gate, Apple `VID_05AC&PID_1116` `MI_08`/`MI_09` state,

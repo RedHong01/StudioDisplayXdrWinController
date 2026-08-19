@@ -28,6 +28,7 @@ StudioDisplayHdrGateBlockState.json
 StudioDisplayHotplugPipelineDecision.json
 StudioDisplayKnownGoodState.json
 StudioDisplayLastFailureState.json
+StudioDisplayPhysicalReenumerationState.json
 StudioDisplayResolutionModeTableBlockState.json
 
 # Machine-local game or chat-app experiments

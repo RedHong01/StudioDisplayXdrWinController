@@ -218,6 +218,10 @@ $results.Add((Test-FileContains -Path $watcher -Pattern 'skipped because an exis
 $results.Add((Test-FileContains -Path $manager -Pattern 'Clear-StudioDisplayLastFailureState' -Name "guard:clear-stale-last-failure-function" -Detail "manager can clear stale failure evidence after physical re-enumeration")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'physical re-enumeration observed' -Name "guard:reconnect-invalidates-stale-last-failure" -Detail "reconnect path invalidates stale Apple USB reboot-required failures before retry")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'Studio Display disconnected' -Name "guard:disconnect-invalidates-stale-last-failure" -Detail "disconnect path invalidates stale Apple USB reboot-required failures")) | Out-Null
+$results.Add((Test-FileContains -Path $manager -Pattern 'Save-StudioDisplayPhysicalReenumerationState' -Name "guard:manager-records-physical-reenumeration-marker" -Detail "manager persists true disconnect/reconnect/resume evidence for offline repair workers")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'StudioDisplayPhysicalReenumerationState\.json' -Name "guard:auto-repair-reads-physical-reenumeration-marker" -Detail "scheduled repair can clear stale gates after a newer physical re-enumeration marker")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'marker is newer than the persisted gate/failure' -Name "guard:auto-repair-clears-stale-physical-gate" -Detail "auto repair refuses to reuse stale Apple USB reboot-required gates after real hot-plug")) | Out-Null
+$results.Add((Test-FileContains -Path $integratedRepair -Pattern 'Ignoring persisted .*physical re-enumeration marker is newer' -Name "guard:integrated-repair-ignores-stale-persisted-gate" -Detail "integrated repair allows one fresh pass after true physical re-enumeration")) | Out-Null
 
 $maintenanceStatePath = Join-Path $InstallRoot "StudioDisplayAutomationMaintenanceState.json"
 $maintenanceState = Read-JsonFile -Path $maintenanceStatePath
@@ -251,16 +255,36 @@ $results.Add((New-GuardResult -Name "runtime:brightness-workers-running" -Passed
 
 if ($observerSnapshot) {
     $snapshot = $observerSnapshot.Event.Data
+    $observerControllerReady = [bool](
+        $snapshot.Controller.Manager.Running -and
+        $snapshot.Controller.SystemBrightnessMirror.Running -and
+        $snapshot.Controller.BrightnessKeyBridge.Running
+    )
+    $controllerReady = [bool]($observerControllerReady -or $brightnessWorkersReady)
     $observerShowsStableHold = [bool](
         $snapshot.Resolution.Current5K -and
         $snapshot.Resolution.FiveK60Enumerated -and
         $snapshot.Hdr.HdrUnsupported -and
         -not $snapshot.Hdr.HdrActive -and
-        $snapshot.Controller.Manager.Running -and
-        $snapshot.Controller.SystemBrightnessMirror.Running -and
-        $snapshot.Controller.BrightnessKeyBridge.Running
+        $controllerReady
     )
-    $results.Add((New-GuardResult -Name "runtime:latest-observer-stable-hold" -Passed $observerShowsStableHold -Detail "latest observer snapshot confirms stable 5K60/brightness during HDR gate hold" -Data $observerSnapshot)) | Out-Null
+    $observerDetail = if ($observerControllerReady) {
+        "latest observer snapshot confirms stable 5K60/brightness during HDR gate hold"
+    }
+    elseif ($brightnessWorkersReady) {
+        "latest observer snapshot confirms stable 5K60/HDR gate hold; current PID files confirm brightness workers recovered after the snapshot"
+    }
+    else {
+        "latest observer snapshot did not confirm brightness worker readiness"
+    }
+    $results.Add((New-GuardResult -Name "runtime:latest-observer-stable-hold" -Passed $observerShowsStableHold -Detail $observerDetail -Data @{
+        Observer = $observerSnapshot
+        CurrentPidState = @{
+            Manager = $managerPid
+            SystemBrightnessMirror = $mirrorPid
+            BrightnessKeyBridge = $bridgePid
+        }
+    })) | Out-Null
 }
 else {
     $results.Add((New-GuardResult -Name "runtime:latest-observer-stable-hold" -Passed $false -Detail "no observer snapshot found" -Data @{ ReportsRoot = $reportsRoot })) | Out-Null

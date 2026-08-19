@@ -51,6 +51,7 @@ $reportsRoot = Join-Path $installRoot "reports"
 $pipelineDecisionFile = Join-Path $installRoot "StudioDisplayHotplugPipelineDecision.json"
 $hdrGateBlockStateFile = Join-Path $installRoot "StudioDisplayHdrGateBlockState.json"
 $lastFailureStateFile = Join-Path $installRoot "StudioDisplayLastFailureState.json"
+$physicalReenumerationStateFile = Join-Path $installRoot "StudioDisplayPhysicalReenumerationState.json"
 $automationMaintenanceStateFile = Join-Path $installRoot "StudioDisplayAutomationMaintenanceState.json"
 $resolutionModeTableBlockStateFile = Join-Path $installRoot "StudioDisplayResolutionModeTableBlockState.json"
 $fastFallbackStateFile = Join-Path $installRoot "StudioDisplayFastVisibleFallbackState.json"
@@ -857,6 +858,32 @@ function Clear-StudioDisplayLastFailureState {
     }
     catch {
         Write-AppLog "Could not clear Studio Display last failure state for $Reason`: $($_.Exception.Message)"
+    }
+}
+
+function Save-StudioDisplayPhysicalReenumerationState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Event,
+        [string]$Reason = "automatic"
+    )
+
+    try {
+        $state = [ordered]@{
+            Version = 1
+            UpdatedAt = (Get-Date).ToString("o")
+            Event = $Event
+            Reason = $Reason
+            DisplayTopologySignature = [string]$script:lastDisplayTopologySignature
+        }
+
+        $state |
+            ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $physicalReenumerationStateFile -Encoding ascii -ErrorAction Stop
+        Write-AppLog "Recorded Studio Display physical re-enumeration marker. event=$Event reason=$Reason."
+    }
+    catch {
+        Write-AppLog "Could not record Studio Display physical re-enumeration marker for $Reason`: $($_.Exception.Message)"
     }
 }
 
@@ -3124,6 +3151,8 @@ try {
                     $script:hdrActiveResolutionSettleUntil = [DateTime]::MinValue
                     Reset-StudioDisplayResolutionModeTableBlock -Reason $repairReason
                     Reset-StudioDisplayHdrGateBlock -Reason $repairReason
+                    $physicalEvent = if ($repairDueToPowerResume) { "PowerResume" } else { "Reconnected" }
+                    Save-StudioDisplayPhysicalReenumerationState -Event $physicalEvent -Reason "$repairReason physical re-enumeration observed"
                     Clear-StudioDisplayLastFailureState -Reason "$repairReason physical re-enumeration observed"
                 }
                 elseif ($repairDueToTopologyChange) {
@@ -3156,12 +3185,16 @@ try {
         }
 
         if (-not $studioDisplayConnected) {
+            $wasConnectedBeforeTick = [bool]$script:lastStudioDisplayConnected
             $script:pendingHdrRepair = $false
             Set-StudioDisplayIntegratedRepairIdle
             $script:lastIntegratedRepairStartedAt = [DateTime]::MinValue
             $script:hdrActiveResolutionSettleUntil = [DateTime]::MinValue
             Reset-StudioDisplayResolutionModeTableBlock -Reason "Studio Display disconnected"
             Reset-StudioDisplayHdrGateBlock -Reason "Studio Display disconnected"
+            if ($wasConnectedBeforeTick) {
+                Save-StudioDisplayPhysicalReenumerationState -Event "Disconnected" -Reason "Studio Display disconnected"
+            }
             Clear-StudioDisplayLastFailureState -Reason "Studio Display disconnected"
         }
 

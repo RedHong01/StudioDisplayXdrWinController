@@ -18,6 +18,10 @@
   disconnect/reconnect or sleep-time physical re-enumeration, allowing the next
   automatic pass to perform one fresh conservative repair instead of immediately
   reusing an old Apple USB reboot-required failure as a blocker.
+- Added a shared `StudioDisplayPhysicalReenumerationState.json` marker. The tray
+  records true disconnect/reconnect/resume evidence, and offline auto-repair
+  workers use that newer marker to clear stale HDR physical gates before running
+  one fresh conservative pass.
 - Installed `HdrScreenshotGuard.ps1` and the offline maintenance guard through
   the release installer so fresh GitHub clones match the local running
   controller component set.

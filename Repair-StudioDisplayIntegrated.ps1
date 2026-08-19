@@ -28,6 +28,7 @@ $advancedColorScript = Join-Path $scriptRoot "Get-StudioDisplayAdvancedColorStat
 $brightnessHidScript = Join-Path $scriptRoot "StudioDisplayHid.ps1"
 $lastFailureStateFile = Join-Path $scriptRoot "StudioDisplayLastFailureState.json"
 $hdrGateBlockStateFile = Join-Path $scriptRoot "StudioDisplayHdrGateBlockState.json"
+$physicalReenumerationStateFile = Join-Path $scriptRoot "StudioDisplayPhysicalReenumerationState.json"
 $powershellExe = if (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe")) { Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe" } else { Join-Path $PSHOME "powershell.exe" }
 $installedToolsRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools"
 $installedManagerRoot = Join-Path $installedToolsRoot "StudioDisplayManager"
@@ -1454,8 +1455,62 @@ function Test-StateMarksAppleUsbRebootRequired {
     return $false
 }
 
+function Get-RepairStateUpdatedAt {
+    param([object]$State)
+
+    if (-not $State) {
+        return [DateTime]::MinValue
+    }
+
+    $updatedAt = [DateTime]::MinValue
+    if ($State.PSObject.Properties.Name -contains "UpdatedAt") {
+        [void][DateTime]::TryParse([string]$State.UpdatedAt, [ref]$updatedAt)
+    }
+
+    if ($updatedAt -eq [DateTime]::MinValue -and $State.PSObject.Properties.Name -contains "Failure" -and $State.Failure) {
+        return Get-RepairStateUpdatedAt -State $State.Failure
+    }
+
+    return $updatedAt
+}
+
+function Get-RepairPhysicalReenumerationMarker {
+    param([DateTime]$BootTime)
+
+    if (-not (Test-Path -LiteralPath $physicalReenumerationStateFile)) {
+        return $null
+    }
+
+    try {
+        $marker = Get-Content -LiteralPath $physicalReenumerationStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $updatedAt = Get-RepairStateUpdatedAt -State $marker
+        if ($updatedAt -eq [DateTime]::MinValue) {
+            return $null
+        }
+        if ($BootTime -gt [DateTime]::MinValue -and $updatedAt -lt $BootTime) {
+            return $null
+        }
+
+        $event = [string]$marker.Event
+        if ($event -notmatch 'Disconnected|Reconnected|PowerResume') {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            UpdatedAt = $updatedAt
+            Event = $event
+            Reason = [string]$marker.Reason
+        }
+    }
+    catch {
+        Write-RepairLog "Could not read Studio Display physical re-enumeration marker: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Get-PersistedAppleUsbRebootRequiredGate {
     $bootTime = Get-RepairSystemBootTime
+    $physicalReenumerationMarker = Get-RepairPhysicalReenumerationMarker -BootTime $bootTime
     $candidates = @(
         [pscustomobject]@{ Path = $hdrGateBlockStateFile; Name = "HDR gate block state"; RequiresGate = $true },
         [pscustomobject]@{ Path = $lastFailureStateFile; Name = "last failure state"; RequiresGate = $false }
@@ -1468,6 +1523,13 @@ function Get-PersistedAppleUsbRebootRequiredGate {
         }
         if (-not (Test-RepairStateFreshForBoot -State $state -BootTime $bootTime)) {
             continue
+        }
+        if ($physicalReenumerationMarker) {
+            $stateUpdatedAt = Get-RepairStateUpdatedAt -State $state
+            if ($stateUpdatedAt -gt [DateTime]::MinValue -and $physicalReenumerationMarker.UpdatedAt -gt $stateUpdatedAt) {
+                Write-RepairLog "Ignoring persisted $($candidate.Name) Apple USB reboot-required gate because a Studio Display physical re-enumeration marker is newer. markerEvent=$($physicalReenumerationMarker.Event) markerUpdatedAt=$($physicalReenumerationMarker.UpdatedAt.ToString('o')) stateUpdatedAt=$($stateUpdatedAt.ToString('o'))"
+                continue
+            }
         }
         if (-not (Test-StateMarksAppleUsbRebootRequired -State $state)) {
             continue

@@ -37,6 +37,7 @@ $launcherLog = Join-Path $reportsRoot "StudioDisplayAutoRepairTask.log"
 $knownGoodStateFile = Join-Path $scriptRoot "StudioDisplayKnownGoodState.json"
 $lastFailureStateFile = Join-Path $scriptRoot "StudioDisplayLastFailureState.json"
 $hdrGateBlockStateFile = Join-Path $scriptRoot "StudioDisplayHdrGateBlockState.json"
+$physicalReenumerationStateFile = Join-Path $scriptRoot "StudioDisplayPhysicalReenumerationState.json"
 $automationMaintenanceStateFile = Join-Path $scriptRoot "StudioDisplayAutomationMaintenanceState.json"
 $powershellExe = Resolve-StudioDisplayPowerShellExe
 
@@ -61,6 +62,88 @@ function Get-AutoRepairSystemBootTime {
     }
 
     return [DateTime]::MinValue
+}
+
+function Get-AutoRepairStateUpdatedAt {
+    param([object]$State)
+
+    if (-not $State) {
+        return [DateTime]::MinValue
+    }
+
+    $updatedAt = [DateTime]::MinValue
+    if ($State.PSObject.Properties.Name -contains "UpdatedAt") {
+        [void][DateTime]::TryParse([string]$State.UpdatedAt, [ref]$updatedAt)
+    }
+
+    if ($updatedAt -eq [DateTime]::MinValue -and $State.PSObject.Properties.Name -contains "Failure" -and $State.Failure) {
+        return Get-AutoRepairStateUpdatedAt -State $State.Failure
+    }
+
+    return $updatedAt
+}
+
+function Get-AutoRepairPhysicalReenumerationMarker {
+    if (-not (Test-Path -LiteralPath $physicalReenumerationStateFile)) {
+        return $null
+    }
+
+    try {
+        $marker = Get-Content -LiteralPath $physicalReenumerationStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $markerUpdatedAt = Get-AutoRepairStateUpdatedAt -State $marker
+        if ($markerUpdatedAt -eq [DateTime]::MinValue) {
+            return $null
+        }
+
+        $bootTime = Get-AutoRepairSystemBootTime
+        if ($bootTime -gt [DateTime]::MinValue -and $markerUpdatedAt -lt $bootTime) {
+            return $null
+        }
+
+        $event = [string]$marker.Event
+        if ($event -notmatch 'Disconnected|Reconnected|PowerResume') {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            UpdatedAt = $markerUpdatedAt
+            Event = $event
+            Reason = [string]$marker.Reason
+            Path = $physicalReenumerationStateFile
+        }
+    }
+    catch {
+        Write-AutoRepairLog "Could not read Studio Display physical re-enumeration marker: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Clear-AutoRepairPhysicalGateIfReenumerated {
+    param(
+        [object]$GateState,
+        [object]$LastFailureState
+    )
+
+    $marker = Get-AutoRepairPhysicalReenumerationMarker
+    if (-not $marker) {
+        return $false
+    }
+
+    $gateUpdatedAt = Get-AutoRepairStateUpdatedAt -State $GateState
+    $failureUpdatedAt = Get-AutoRepairStateUpdatedAt -State $LastFailureState
+    $latestGateEvidenceAt = $gateUpdatedAt
+    if ($failureUpdatedAt -gt $latestGateEvidenceAt) {
+        $latestGateEvidenceAt = $failureUpdatedAt
+    }
+
+    if ($latestGateEvidenceAt -eq [DateTime]::MinValue -or $marker.UpdatedAt -le $latestGateEvidenceAt) {
+        return $false
+    }
+
+    Remove-Item -LiteralPath $hdrGateBlockStateFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lastFailureStateFile -Force -ErrorAction SilentlyContinue
+    Write-AutoRepairLog "Cleared HDR physical re-enumeration gate because a Studio Display physical re-enumeration marker is newer than the persisted gate/failure. markerEvent=$($marker.Event) markerUpdatedAt=$($marker.UpdatedAt.ToString('o')) evidenceUpdatedAt=$($latestGateEvidenceAt.ToString('o'))"
+    return $true
 }
 
 function Save-AutoRepairMaintenanceState {
@@ -127,12 +210,16 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             $gateState = Get-Content -LiteralPath $hdrGateBlockStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
         }
 
-        if (-not $gateState -or -not [bool]$gateState.RequiresPhysicalReenumeration) {
-            $lastFailure = $null
-            if (Test-Path -LiteralPath $lastFailureStateFile) {
-                $lastFailure = Get-Content -LiteralPath $lastFailureStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
-            }
+        $lastFailure = $null
+        if (Test-Path -LiteralPath $lastFailureStateFile) {
+            $lastFailure = Get-Content -LiteralPath $lastFailureStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        }
 
+        if (Clear-AutoRepairPhysicalGateIfReenumerated -GateState $gateState -LastFailureState $lastFailure) {
+            return $false
+        }
+
+        if (-not $gateState -or -not [bool]$gateState.RequiresPhysicalReenumeration) {
             $classification = if ($lastFailure) { [string]$lastFailure.Classification } else { "" }
             $lastFailureRequiresPhysical = [bool](
                 $lastFailure -and
