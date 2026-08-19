@@ -905,7 +905,8 @@ function Get-StudioDisplayLastFailureState {
         [void][DateTime]::TryParse([string]$failureState.UpdatedAt, [ref]$updatedAt)
         $bootTime = Get-StudioDisplaySystemBootTime
         if ($bootTime -gt [DateTime]::MinValue -and $updatedAt -gt [DateTime]::MinValue -and $updatedAt -lt $bootTime) {
-            Write-AppLog "Ignoring stale Studio Display failure state from before current boot. UpdatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))."
+            Remove-Item -LiteralPath $lastFailureStateFile -Force -ErrorAction SilentlyContinue
+            Write-AppLog "Cleared stale Studio Display failure state from before current boot. UpdatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))."
             return $null
         }
 

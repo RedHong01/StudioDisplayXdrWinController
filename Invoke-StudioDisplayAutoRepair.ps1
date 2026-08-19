@@ -303,6 +303,16 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             $lastFailure = Get-Content -LiteralPath $lastFailureStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
         }
 
+        if ($lastFailure) {
+            $lastFailureUpdatedAtForBoot = Get-AutoRepairStateUpdatedAt -State $lastFailure
+            $bootTimeForFailure = Get-AutoRepairSystemBootTime
+            if ($bootTimeForFailure -gt [DateTime]::MinValue -and $lastFailureUpdatedAtForBoot -gt [DateTime]::MinValue -and $lastFailureUpdatedAtForBoot -lt $bootTimeForFailure) {
+                Remove-Item -LiteralPath $lastFailureStateFile -Force -ErrorAction SilentlyContinue
+                Write-AutoRepairLog "Cleared stale Studio Display last failure state because the machine rebooted after it was recorded. updatedAt=$($lastFailureUpdatedAtForBoot.ToString('o')) boot=$($bootTimeForFailure.ToString('o'))"
+                $lastFailure = $null
+            }
+        }
+
         $lastFailureLogMarksRebootRequired = [bool](
             $lastFailure -and
             ($lastFailure.PSObject.Properties.Name -contains "RepairLog") -and
