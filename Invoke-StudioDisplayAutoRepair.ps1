@@ -101,7 +101,7 @@ function Get-AutoRepairPhysicalReenumerationMarker {
         }
 
         $event = [string]$marker.Event
-        if ($event -notmatch 'Disconnected|Reconnected|PowerResume') {
+        if ($event -notmatch 'Disconnected|Reconnected|PowerResume|HdrGateOpened') {
             return $null
         }
 
@@ -372,9 +372,24 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             -not $State.HdrSupported -and
             -not $State.HdrActive
         )
+        $restartOnlyGate = [bool](
+            $lastFailure -and
+            (
+                [bool]$lastFailure.WindowsRestartRequired -or
+                ([bool]$lastFailure.AppleUsbRebootRequired -and [bool]$lastFailure.PhysicalReenumerationAlreadyObserved)
+            )
+        )
 
         if ($gateStillMatches) {
-            Save-AutoRepairMaintenanceState -Stage "HdrGateWaitingForPhysicalReenumeration" -Action "SkipDeepRepair" -Detail "Preflight still matches the last HDR physical gate: 5K60 is stable, but HighDynamicRangeSupported=False." -State $State -GateState $gateState
+            $stage = if ($restartOnlyGate) { "HdrGateWaitingForWindowsRestart" } else { "HdrGateWaitingForPhysicalReenumeration" }
+            $action = if ($restartOnlyGate) { "SkipUntilWindowsRestart" } else { "SkipDeepRepair" }
+            $detail = if ($restartOnlyGate) {
+                "Preflight still matches the last HDR gate: 5K60 is stable, HighDynamicRangeSupported=False, and Apple USB 3010 happened after physical re-enumeration. Waiting for Windows restart instead of repeating hot-plug repair."
+            }
+            else {
+                "Preflight still matches the last HDR physical gate: 5K60 is stable, but HighDynamicRangeSupported=False."
+            }
+            Save-AutoRepairMaintenanceState -Stage $stage -Action $action -Detail $detail -State $State -GateState $gateState
             return $true
         }
 
@@ -384,8 +399,16 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             $lastFailureLogMarksRebootRequired
         )
         if ($persistedAppleUsbRebootGate) {
-            Save-AutoRepairMaintenanceState -Stage "HdrGateWaitingForPhysicalReenumeration" -Action "SkipDeepRepair" -Detail "Persisted Apple USB reboot-required gate is active. Skipping deep repair until reboot, resume, or full Thunderbolt/USB physical re-enumeration even if the current probe is partially degraded." -State $State -GateState $gateState
-            Write-AutoRepairLog "Skipped disruptive repair because the persisted Apple USB reboot-required physical gate is still active and HDR support is not visible."
+            $stage = if ($restartOnlyGate) { "HdrGateWaitingForWindowsRestart" } else { "HdrGateWaitingForPhysicalReenumeration" }
+            $action = if ($restartOnlyGate) { "SkipUntilWindowsRestart" } else { "SkipDeepRepair" }
+            $detail = if ($restartOnlyGate) {
+                "Persisted Apple USB reboot-required gate is active after physical re-enumeration was already observed. Skipping deep repair until Windows restart even if the current probe is partially degraded."
+            }
+            else {
+                "Persisted Apple USB reboot-required gate is active. Skipping deep repair until reboot, resume, or full Thunderbolt/USB physical re-enumeration even if the current probe is partially degraded."
+            }
+            Save-AutoRepairMaintenanceState -Stage $stage -Action $action -Detail $detail -State $State -GateState $gateState
+            Write-AutoRepairLog "Skipped disruptive repair because the persisted Apple USB reboot-required gate is still active and HDR support is not visible. restartOnlyGate=$restartOnlyGate"
             return $true
         }
     }
@@ -609,6 +632,19 @@ function Save-AutoRepairFailureState {
             )
         )
         $appleUsbRebootRequired = Test-AutoRepairRepairLogMarksAppleUsbRebootRequired -RepairLogText $repairLogText
+        $physicalMarker = Get-AutoRepairPhysicalReenumerationMarker
+        $physicalReenumerationAlreadyObserved = [bool]($appleUsbRebootRequired -and $hdrGateClosed -and $physicalMarker)
+        $windowsRestartRequired = [bool]($appleUsbRebootRequired -and $hdrGateClosed)
+        $physicalMarkerState = if ($physicalMarker) {
+            [ordered]@{
+                UpdatedAt = $physicalMarker.UpdatedAt.ToString("o")
+                Event = [string]$physicalMarker.Event
+                Reason = [string]$physicalMarker.Reason
+            }
+        }
+        else {
+            $null
+        }
         $classification = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart -and $appleUsbRebootRequired) {
             "ResolutionModeTableAndHdrGateBlockedWithAppleUsbReferenceModeFailedStartAndRebootRequired"
         }
@@ -656,8 +692,14 @@ function Save-AutoRepairFailureState {
             AppleUsb = $State.AppleUsb
             AppleUsbReferenceModeFailedStart = $appleUsbReferenceModeFailedStart
             AppleUsbRebootRequired = $appleUsbRebootRequired
+            WindowsRestartRequired = $windowsRestartRequired
+            PhysicalReenumerationAlreadyObserved = $physicalReenumerationAlreadyObserved
+            PhysicalReenumerationMarker = $physicalMarkerState
             ValidationDetail = $State.Detail
-            NextAction = if ($appleUsbRebootRequired -and $hdrGateClosed) {
+            NextAction = if ($physicalReenumerationAlreadyObserved) {
+                "Windows reported pnputil 3010/reboot-required after a fresh Studio Display physical re-enumeration marker. Preserve 5K60/brightness and wait for a Windows restart or system-level USB stack reset; repeated hot-plug alone has already been tried in this boot."
+            }
+            elseif ($appleUsbRebootRequired -and $hdrGateClosed) {
                 "Windows reported pnputil 3010/reboot-required while rebuilding the Apple USB control interface. Preserve 5K60/brightness, stop HDR identity rollback, and retry only after reboot, resume, or a full Thunderbolt/USB physical re-enumeration."
             }
             elseif ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart) {

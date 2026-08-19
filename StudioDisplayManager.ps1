@@ -981,6 +981,8 @@ function Save-StudioDisplayAutomationMaintenanceState {
                     Classification = [string]$FailureState.Classification
                     AppleUsbReferenceModeFailedStart = [bool]$FailureState.AppleUsbReferenceModeFailedStart
                     AppleUsbRebootRequired = [bool]$FailureState.AppleUsbRebootRequired
+                    WindowsRestartRequired = [bool]$FailureState.WindowsRestartRequired
+                    PhysicalReenumerationAlreadyObserved = [bool]$FailureState.PhysicalReenumerationAlreadyObserved
                     RepairLog = [string]$FailureState.RepairLog
                 }
             } else { $null }
@@ -991,7 +993,7 @@ function Save-StudioDisplayAutomationMaintenanceState {
                 "HDR is active after the setter, not merely WCG/Advanced Color.",
                 "Studio Display brightness HID readback succeeds.",
                 "If Apple VID_05AC PID_1116 MI_08/MI_09 failed-start is paired with HdrSupported=False, wait for Thunderbolt/USB physical re-enumeration instead of repeating deep repair.",
-                "If pnputil returns 3010 for the Apple USB composite/upstream parent, preserve 5K60/brightness and wait for reboot or full Thunderbolt/USB re-enumeration."
+                "If pnputil returns 3010 for the Apple USB composite/upstream parent after a fresh physical re-enumeration marker, preserve 5K60/brightness and wait for Windows restart instead of looping hot-plug repair."
             )
         }
 
@@ -2513,24 +2515,39 @@ function Invoke-StudioDisplayHdrActivation {
             $script:pendingHdrRepair = $true
             $failureState = Get-StudioDisplayLastFailureState
             $requiresUsbReboot = [bool]($failureState -and [bool]$failureState.AppleUsbRebootRequired)
-            $waitDetail = if ($requiresUsbReboot) {
+            $requiresWindowsRestart = [bool]($failureState -and ([bool]$failureState.WindowsRestartRequired -or ([bool]$failureState.AppleUsbRebootRequired -and [bool]$failureState.PhysicalReenumerationAlreadyObserved)))
+            $waitDetail = if ($requiresWindowsRestart) {
+                "5K60 is stable, Windows reports HighDynamicRangeSupported=False, and Apple USB parent reconfiguration returned pnputil 3010 after a fresh physical re-enumeration marker. Waiting for Windows restart instead of another hot-plug loop."
+            }
+            elseif ($requiresUsbReboot) {
                 "5K60 is stable, Windows reports HighDynamicRangeSupported=False, and the last Apple USB parent restart returned pnputil 3010/reboot-required."
             }
             else {
                 "5K60 is stable, Windows reports HighDynamicRangeSupported=False, and the last failure indicates Apple USB MI_08/MI_09 failed-start."
             }
-            $decisionDetail = if ($requiresUsbReboot) {
+            $decisionDetail = if ($requiresWindowsRestart) {
+                "5K60 is stable but HDR support is blocked after Apple USB parent reconfiguration returned pnputil 3010 even after physical re-enumeration; waiting for Windows restart rather than repeating hot-plug repair."
+            }
+            elseif ($requiresUsbReboot) {
                 "5K60 is stable but HDR support is blocked after Apple USB parent reconfiguration returned pnputil 3010; waiting for reboot, resume, or full Thunderbolt/USB re-enumeration."
             }
             else {
                 "5K60 is stable but HDR support is blocked by a previous Apple USB control-interface failed-start; waiting for physical Thunderbolt/USB re-enumeration."
             }
+            $maintenanceStage = if ($requiresWindowsRestart) { "HdrGateWaitingForWindowsRestart" } else { "HdrGateWaitingForPhysicalReenumeration" }
+            $maintenanceAction = if ($requiresWindowsRestart) { "WaitForWindowsRestart" } else { "WaitForReconnectOrResume" }
+            $pipelineStage = if ($requiresWindowsRestart) { "HdrCapabilityGateWaitingForWindowsRestart" } else { "HdrCapabilityGateWaitingForPhysicalReenumeration" }
             if (($now - $script:lastHdrGateBlockedLogAt).TotalSeconds -ge $hdrGateBlockedLogCooldownSeconds) {
                 $script:lastHdrGateBlockedLogAt = $now
-                Write-AppLog "Deferred HDR deep repair for $Reason because the previous failure requires reboot/resume or fresh Thunderbolt/USB physical re-enumeration. Stable 5K60 is preserved instead of looping."
+                if ($requiresWindowsRestart) {
+                    Write-AppLog "Deferred HDR deep repair for $Reason because Apple USB parent reconfiguration reported 3010 after physical re-enumeration. Stable 5K60 is preserved; waiting for Windows restart instead of looping hot-plug repair."
+                }
+                else {
+                    Write-AppLog "Deferred HDR deep repair for $Reason because the previous failure requires reboot/resume or fresh Thunderbolt/USB physical re-enumeration. Stable 5K60 is preserved instead of looping."
+                }
             }
-            Save-StudioDisplayAutomationMaintenanceState -Stage "HdrGateWaitingForPhysicalReenumeration" -Action "WaitForReconnectOrResume" -Detail $waitDetail -ResolutionState $resolutionState -HdrState $state -FailureState $failureState
-            Save-StudioDisplayPipelineDecision -Reason $Reason -Stage "HdrCapabilityGateWaitingForPhysicalReenumeration" -Action "Defer" -Detail $decisionDetail -ResolutionState $resolutionState -HdrState $state
+            Save-StudioDisplayAutomationMaintenanceState -Stage $maintenanceStage -Action $maintenanceAction -Detail $waitDetail -ResolutionState $resolutionState -HdrState $state -FailureState $failureState
+            Save-StudioDisplayPipelineDecision -Reason $Reason -Stage $pipelineStage -Action "Defer" -Detail $decisionDetail -ResolutionState $resolutionState -HdrState $state
             return $false
         }
 
