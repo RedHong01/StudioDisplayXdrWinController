@@ -6,6 +6,7 @@ param(
     [switch]$RestartAppleUsb4Router,
     [switch]$EnsureBootCampMonitorDriver,
     [switch]$AllowWcgFallback,
+    [switch]$AllowHdrIdentityRollback,
     [switch]$SkipHdr,
     [switch]$SkipAppleUsbRepair,
     [switch]$SkipBrightness,
@@ -167,6 +168,7 @@ function Start-ElevatedSelf {
             "RestartAppleUsb4Router",
             "EnsureBootCampMonitorDriver",
             "AllowWcgFallback",
+            "AllowHdrIdentityRollback",
             "SkipHdr",
             "SkipAppleUsbRepair",
             "SkipBrightness"
@@ -1269,6 +1271,14 @@ function Invoke-HdrIdentityRollbackRepair {
         }
     }
 
+    if (-not $AllowHdrIdentityRollback) {
+        Write-RepairLog "HDR identity rollback skipped by default. It removes/rebinds the monitor INF and may trigger display re-enumeration; pass -AllowHdrIdentityRollback only for an explicit diagnostic round."
+        return [pscustomobject]@{
+            ExitCode = 0
+            Output = @()
+        }
+    }
+
     if (-not (Test-Path -LiteralPath $hdrIdentityRollbackScript)) {
         Write-RepairLog "HDR identity rollback script is missing: $hdrIdentityRollbackScript"
         return [pscustomobject]@{
@@ -1819,6 +1829,9 @@ try {
         if ($hdrStateAfterAppleUsbRepair.HdrUnsupported -and -not $hdrStateAfterAppleUsbRepair.HdrActive) {
             if ($appleUsbRepairRequiresReboot) {
                 Write-RepairLog "HDR gate is still closed, but Apple USB parent reconfiguration is reboot-required. HDR identity rollback is intentionally skipped because monitor-INF churn cannot reopen HighDynamicRangeSupported=False while USB configuration is pending."
+            }
+            elseif (-not $AllowHdrIdentityRollback) {
+                Write-RepairLog "HDR gate is still closed after Apple USB/HID repair. Skipping HDR identity rollback by default because it removes/reinstalls the Boot Camp-style monitor INF and can disturb stable 5K60/brightness. Pass -AllowHdrIdentityRollback for an explicit diagnostic round."
             }
             else {
                 Write-RepairLog "HDR gate is still closed after Apple USB/HID repair. Running guarded HDR identity rollback once: test APPA/Generic PnP HDR-capable identity, then restore Boot Camp-style 5K60 fallback automatically if HDR does not open."
