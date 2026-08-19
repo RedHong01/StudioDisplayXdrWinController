@@ -1796,6 +1796,7 @@ try {
         $brightnessHidReadyBeforeRepair = Invoke-RepairStage -Label "Brightness HID preflight" -ScriptBlock { Test-BrightnessHidReadyQuiet }
         $needsAppleUsbRepair = [bool](-not $hdrPreflightState.HdrActive -or -not $brightnessHidReadyBeforeRepair)
         $hdrStateAfterAppleUsbRepair = $hdrPreflightState
+        $appleUsbRepairSkipReason = ""
         $persistedAppleUsbRebootGate = Get-PersistedAppleUsbRebootRequiredGate
 
         if (
@@ -1807,6 +1808,7 @@ try {
         ) {
             $appleUsbRepairRequiresReboot = $true
             $needsAppleUsbRepair = $false
+            $appleUsbRepairSkipReason = "an existing Apple USB reboot-required HDR gate is active"
             Write-RepairLog "Existing Apple USB reboot-required HDR gate is active after 5K60 recovery (source=$($persistedAppleUsbRebootGate.Source), updatedAt=$($persistedAppleUsbRebootGate.UpdatedAt), classification=$($persistedAppleUsbRebootGate.Classification)). Skipping Apple USB/HID interface repair for this pass; Windows must complete USB configuration through reboot, resume, or full Thunderbolt/USB physical re-enumeration."
         }
 
@@ -1823,7 +1825,12 @@ try {
             Write-RepairLog "HDR state after Apple USB/HID repair: $(Format-HdrRuntimeState -State $hdrStateAfterAppleUsbRepair)"
         }
         else {
-            Write-RepairLog "Apple USB/HID interface repair skipped because HDR is already active and brightness HID is readable."
+            if (-not [string]::IsNullOrWhiteSpace($appleUsbRepairSkipReason)) {
+                Write-RepairLog "Apple USB/HID interface repair skipped because $appleUsbRepairSkipReason."
+            }
+            else {
+                Write-RepairLog "Apple USB/HID interface repair skipped because HDR is already active and brightness HID is readable."
+            }
         }
 
         if ($hdrStateAfterAppleUsbRepair.HdrUnsupported -and -not $hdrStateAfterAppleUsbRepair.HdrActive) {

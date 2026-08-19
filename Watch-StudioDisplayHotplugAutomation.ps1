@@ -483,7 +483,7 @@ function Classify-LogLine {
     elseif ($Line -match 'CM_PROB_FAILED_START.*(MI_08|MI_09)|(MI_08|MI_09).*(CM_PROB_FAILED_START)') {
         $issue = "AppleUsbMi08Mi09FailedStart"
     }
-    elseif ($Line -match 'APPLE_USB_REBOOT_REQUIRED=True|System reboot is needed to complete configuration operations|exitCode=3010|Existing Apple USB reboot-required HDR gate is active') {
+    elseif ($Line -match 'APPLE_USB_REBOOT_REQUIRED=True|System reboot is needed to complete configuration operations|exitCode=3010|Existing Apple USB reboot-required HDR gate is active|skipped because an existing Apple USB reboot-required HDR gate is active') {
         $issue = "AppleUsbRestartRequiresReboot"
     }
     elseif ($Line -match 'Apple USB interface repair finished with unresolved failed interfaces') {
