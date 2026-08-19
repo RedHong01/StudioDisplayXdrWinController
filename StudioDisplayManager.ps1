@@ -894,9 +894,11 @@ function Get-StudioDisplayPhysicalReenumerationMarker {
     }
 }
 
-function Get-StudioDisplayLastFailureState {
+function Clear-StudioDisplayStaleLastFailureStateAfterBoot {
+    param([string]$Reason = "automatic")
+
     if (-not (Test-Path -LiteralPath $lastFailureStateFile)) {
-        return $null
+        return $false
     }
 
     try {
@@ -906,10 +908,30 @@ function Get-StudioDisplayLastFailureState {
         $bootTime = Get-StudioDisplaySystemBootTime
         if ($bootTime -gt [DateTime]::MinValue -and $updatedAt -gt [DateTime]::MinValue -and $updatedAt -lt $bootTime) {
             Remove-Item -LiteralPath $lastFailureStateFile -Force -ErrorAction SilentlyContinue
-            Write-AppLog "Cleared stale Studio Display failure state from before current boot. UpdatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))."
-            return $null
+            Write-AppLog "Cleared stale Studio Display failure state from before current boot for $Reason. UpdatedAt=$($updatedAt.ToString('o')) boot=$($bootTime.ToString('o'))."
+            return $true
         }
+    }
+    catch {
+        Write-AppLog "Could not evaluate stale Studio Display failure state for $Reason`: $($_.Exception.Message)"
+    }
 
+    return $false
+}
+
+function Get-StudioDisplayLastFailureState {
+    if (-not (Test-Path -LiteralPath $lastFailureStateFile)) {
+        return $null
+    }
+
+    if (Clear-StudioDisplayStaleLastFailureStateAfterBoot -Reason "read") {
+        return $null
+    }
+
+    try {
+        $failureState = Get-Content -LiteralPath $lastFailureStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $updatedAt = [DateTime]::MinValue
+        [void][DateTime]::TryParse([string]$failureState.UpdatedAt, [ref]$updatedAt)
         $marker = Get-StudioDisplayPhysicalReenumerationMarker
         $markerNearFailure = [bool](
             $marker -and
@@ -2852,6 +2874,7 @@ $lastStudioDisplayPnpCheckResult = $false
 $lastHdrScreenshotGuardStartAttemptAt = [DateTime]::MinValue
 $lastBrightnessServiceRecoveryAttemptAt = [DateTime]::MinValue
 
+$staleFailureClearedAfterBoot = Clear-StudioDisplayStaleLastFailureStateAfterBoot -Reason "tray startup"
 Restore-StudioDisplayHdrGateBlockState -Reason "tray startup"
 Restore-StudioDisplayResolutionModeTableBlockState -Reason "tray startup"
 $staleMaintenanceClearedAfterBoot = Clear-StudioDisplayStaleAutomationMaintenanceStateAfterBoot -Reason "tray startup"
@@ -3367,7 +3390,7 @@ try {
     if ($startupStudioDisplayConnected) {
         $script:lastDisplayRepairAt = Get-Date
         $script:pendingHdrRepair = $true
-        if ($staleMaintenanceClearedAfterBoot) {
+        if ($staleFailureClearedAfterBoot -or $staleMaintenanceClearedAfterBoot) {
             Save-StudioDisplayAutomationMaintenanceState -Stage "PostRebootRecoveryProbe" -Action "ProbeAndRecover" -Detail "Windows restarted after a previous Studio Display Apple USB 3010 gate; stale maintenance/failure gates were cleared and the controller is probing 5K/HDR/brightness again."
         }
         Save-StudioDisplayPipelineDecision -Reason "tray startup HDR restore" -Stage "StartupProbe" -Action "ProbeAndDecide" -Detail "The tray started while Studio Display evidence is present; probing current gates before deciding whether to rebuild."

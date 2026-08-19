@@ -7,6 +7,15 @@ param(
 
 $ErrorActionPreference = "Continue"
 
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $SourceRoot = $PSScriptRoot
+    }
+    elseif ($MyInvocation.MyCommand.Path) {
+        $SourceRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+}
+
 $reportsRoot = Join-Path $InstallRoot "reports"
 if (-not $ReportPath) {
     $ReportPath = Join-Path $reportsRoot ("StudioDisplayOfflineMaintenanceGuards-{0}.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
@@ -247,10 +256,12 @@ $results.Add((Test-FileContains -Path $autoRepair -Pattern 'physicalMarkerNearFa
 $results.Add((Test-FileContains -Path $manager -Pattern 'Migrated legacy Studio Display Apple USB 3010 failure state to WindowsRestartRequired' -Name "guard:manager-persists-legacy-3010-migration" -Detail "manager writes migrated Windows restart gates back to the shared failure JSON")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Migrated legacy Studio Display Apple USB 3010 failure state to WindowsRestartRequired before skipping deep repair' -Name "guard:auto-repair-persists-legacy-3010-migration" -Detail "scheduled repair writes migrated Windows restart gates before skipping deep repair")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'Cleared stale Studio Display failure state from before current boot' -Name "guard:manager-clears-stale-failure-after-reboot" -Detail "manager deletes pre-reboot Apple USB failure JSON instead of only ignoring it in memory")) | Out-Null
+$results.Add((Test-FileContains -Path $manager -Pattern 'Clear-StudioDisplayStaleLastFailureStateAfterBoot -Reason "tray startup"' -Name "guard:manager-clears-stale-failure-during-tray-startup" -Detail "tray startup clears pre-reboot Apple USB failure JSON before restoring persisted HDR gates")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Cleared stale Studio Display last failure state because the machine rebooted after it was recorded' -Name "guard:auto-repair-clears-stale-failure-after-reboot" -Detail "scheduled repair deletes pre-reboot Apple USB failure JSON before evaluating gates")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'Cleared stale Studio Display automation maintenance state for \$Reason because the machine rebooted after it was recorded' -Name "guard:manager-clears-stale-maintenance-after-reboot" -Detail "manager deletes pre-reboot maintenance JSON before writing fresh post-reboot probe state")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'Cleared stale Studio Display automation maintenance state because the machine rebooted after it was recorded' -Name "guard:auto-repair-clears-stale-maintenance-after-reboot" -Detail "scheduled repair deletes pre-reboot maintenance JSON before evaluating gates")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'PostRebootRecoveryProbe' -Name "guard:manager-records-post-reboot-recovery-probe" -Detail "manager records an explicit post-reboot recovery probe after clearing stale restart-gate state")) | Out-Null
+$results.Add((Test-FileContains -Path $manager -Pattern '\$staleFailureClearedAfterBoot -or \$staleMaintenanceClearedAfterBoot' -Name "guard:manager-probes-after-stale-failure-or-maintenance-clear" -Detail "post-reboot recovery probe is triggered when either failure or maintenance restart-gate state was cleared")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'HdrGateWaitingForWindowsRestart' -Name "guard:manager-reports-windows-restart-gate" -Detail "manager reports a distinct Windows restart gate after physical re-enumeration has already been tried")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'SkipUntilWindowsRestart' -Name "guard:auto-repair-skips-until-windows-restart" -Detail "scheduled repair does not repeat disruptive deep repair after Apple USB 3010 survives physical re-enumeration")) | Out-Null
 $results.Add((Test-FileContains -Path $manager -Pattern 'Restore-BrightnessServicesWhenSafe' -Name "guard:manager-restores-brightness-after-stale-repair" -Detail "manager restarts brightness workers after a stalled/non-active repair releases the display pipeline")) | Out-Null
