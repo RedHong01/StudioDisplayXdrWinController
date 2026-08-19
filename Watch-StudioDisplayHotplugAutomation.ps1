@@ -5,6 +5,7 @@ param(
     [int]$PollSeconds = 3,
     [int]$CompletionQuietSeconds = 75,
     [switch]$ExitAfterTaskCompletes,
+    [switch]$ReplaceExisting,
     [string]$RunLabel = "passive hot-plug observer",
     [string]$TaskName = "Studio Display XDR Win Controller Auto Repair"
 )
@@ -43,6 +44,59 @@ $resolutionLadderScript = Join-Path $installRoot "Test-StudioDisplayResolutionLa
 $advancedColorScript = Join-Path $installRoot "Get-StudioDisplayAdvancedColorState.ps1"
 
 New-Item -ItemType Directory -Force -Path $reportsRoot -ErrorAction SilentlyContinue | Out-Null
+
+function Test-ObserverProcessRunning {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0 -or $ProcessId -eq $PID) {
+        return $false
+    }
+
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return [bool]$process
+    }
+    catch {
+        return $false
+    }
+}
+
+function Initialize-ObserverSingleton {
+    if (-not (Test-Path -LiteralPath $pidPath)) {
+        return
+    }
+
+    $existingPidText = Get-Content -LiteralPath $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($existingPidText -notmatch '^\d+$') {
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $existingPid = [int]$existingPidText
+    if (-not (Test-ObserverProcessRunning -ProcessId $existingPid)) {
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($ReplaceExisting) {
+        try {
+            Stop-Process -Id $existingPid -Force -ErrorAction Stop
+            Start-Sleep -Milliseconds 500
+            Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+            Write-Host ("[{0}] observer Replaced existing passive observer PID {1}." -f (Get-Date -Format "HH:mm:ss"), $existingPid)
+        }
+        catch {
+            Write-Host ("[{0}] observer Existing passive observer PID {1} could not be replaced: {2}" -f (Get-Date -Format "HH:mm:ss"), $existingPid, $_.Exception.Message)
+            exit 9
+        }
+        return
+    }
+
+    Write-Host ("[{0}] observer Passive hot-plug observer already running as PID {1}; use -ReplaceExisting for a fresh test chain." -f (Get-Date -Format "HH:mm:ss"), $existingPid)
+    exit 9
+}
+
+Initialize-ObserverSingleton
 Set-Content -LiteralPath $pidPath -Value $PID -Encoding ascii -ErrorAction SilentlyContinue
 
 if (-not ([System.Management.Automation.PSTypeName]'StudioDisplayObserverUser32').Type) {
