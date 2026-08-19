@@ -2380,8 +2380,15 @@ function Invoke-StudioDisplayHdrActivation {
         )
 
         if ($hdrGateOpenDuringResolutionSettle) {
-            if ($script:hdrGateRequiresPhysicalReenumeration) {
-                Reset-StudioDisplayHdrGateBlock -Reason "$Reason HDR support visible while 5K mode table is settling"
+            $hdrOpenedGateReason = "$Reason HDR support visible while 5K mode table is settling"
+            if (
+                $script:hdrGateRequiresPhysicalReenumeration -or
+                (Test-Path -LiteralPath $hdrGateBlockStateFile) -or
+                (Test-Path -LiteralPath $lastFailureStateFile)
+            ) {
+                Reset-StudioDisplayHdrGateBlock -Reason $hdrOpenedGateReason
+                Clear-StudioDisplayLastFailureState -Reason $hdrOpenedGateReason
+                Save-StudioDisplayPhysicalReenumerationState -Event "HdrGateOpened" -Reason $hdrOpenedGateReason
             }
 
             if (-not $script:hdrActiveResolutionSettleUntil -or $script:hdrActiveResolutionSettleUntil -le [DateTime]::MinValue) {
