@@ -25,6 +25,8 @@ $hdrIdentityRollbackScript = Join-Path $scriptRoot "Repair-StudioDisplayHdrIdent
 $hdrStateScript = Join-Path $scriptRoot "Set-StudioDisplayHdrState.ps1"
 $advancedColorScript = Join-Path $scriptRoot "Get-StudioDisplayAdvancedColorState.ps1"
 $brightnessHidScript = Join-Path $scriptRoot "StudioDisplayHid.ps1"
+$lastFailureStateFile = Join-Path $scriptRoot "StudioDisplayLastFailureState.json"
+$hdrGateBlockStateFile = Join-Path $scriptRoot "StudioDisplayHdrGateBlockState.json"
 $powershellExe = if (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe")) { Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe" } else { Join-Path $PSHOME "powershell.exe" }
 $installedToolsRoot = Join-Path $env:LOCALAPPDATA "StudioDisplayTools"
 $installedManagerRoot = Join-Path $installedToolsRoot "StudioDisplayManager"
@@ -1354,6 +1356,157 @@ function Format-HdrRuntimeState {
     return "active=$($State.HdrActive), supported=$($State.HdrSupported), unsupported=$($State.HdrUnsupported), wcg=$($State.WcgActive)"
 }
 
+function Get-RepairSystemBootTime {
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        return [datetime]$os.LastBootUpTime
+    }
+    catch {
+        return $null
+    }
+}
+
+function Read-PersistedRepairState {
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-RepairLog "Could not read persisted repair state '$Path': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Test-RepairStateFreshForBoot {
+    param(
+        [object]$State,
+        [AllowNull()][object]$BootTime
+    )
+
+    if (-not $State -or -not $BootTime) {
+        return $true
+    }
+
+    $updatedAt = $null
+    foreach ($propertyName in @("UpdatedAt", "Timestamp")) {
+        if ($State.PSObject.Properties.Name -contains $propertyName -and $State.$propertyName) {
+            $updatedAt = [string]$State.$propertyName
+            break
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($updatedAt)) {
+        return $true
+    }
+
+    try {
+        $stateTime = [datetimeoffset]::Parse($updatedAt)
+        return ($stateTime.LocalDateTime -ge $BootTime.AddMinutes(-2))
+    }
+    catch {
+        return $true
+    }
+}
+
+function Test-StateMarksAppleUsbRebootRequired {
+    param([object]$State)
+
+    if (-not $State) {
+        return $false
+    }
+
+    $classification = ""
+    $detail = ""
+    if ($State.PSObject.Properties.Name -contains "Classification") {
+        $classification = [string]$State.Classification
+    }
+    if ($State.PSObject.Properties.Name -contains "Detail") {
+        $detail = [string]$State.Detail
+    }
+
+    if (
+        ($State.PSObject.Properties.Name -contains "AppleUsbRebootRequired" -and [bool]$State.AppleUsbRebootRequired) -or
+        $classification -match 'RebootRequired|AppleUsbRebootRequired' -or
+        $detail -match '3010|reboot-required|reboot required'
+    ) {
+        return $true
+    }
+
+    if ($State.PSObject.Properties.Name -contains "Failure") {
+        return Test-StateMarksAppleUsbRebootRequired -State $State.Failure
+    }
+
+    return $false
+}
+
+function Get-PersistedAppleUsbRebootRequiredGate {
+    $bootTime = Get-RepairSystemBootTime
+    $candidates = @(
+        [pscustomobject]@{ Path = $hdrGateBlockStateFile; Name = "HDR gate block state"; RequiresGate = $true },
+        [pscustomobject]@{ Path = $lastFailureStateFile; Name = "last failure state"; RequiresGate = $false }
+    )
+
+    foreach ($candidate in $candidates) {
+        $state = Read-PersistedRepairState -Path $candidate.Path
+        if (-not $state) {
+            continue
+        }
+        if (-not (Test-RepairStateFreshForBoot -State $state -BootTime $bootTime)) {
+            continue
+        }
+        if (-not (Test-StateMarksAppleUsbRebootRequired -State $state)) {
+            continue
+        }
+
+        $requiresPhysicalGate = $true
+        if ($candidate.RequiresGate) {
+            $requiresPhysicalGate = [bool](
+                ($state.PSObject.Properties.Name -contains "RequiresPhysicalReenumeration" -and [bool]$state.RequiresPhysicalReenumeration) -or
+                ($state.PSObject.Properties.Name -contains "AppleUsbRebootRequired" -and [bool]$state.AppleUsbRebootRequired) -or
+                ($state.PSObject.Properties.Name -contains "Failure" -and (Test-StateMarksAppleUsbRebootRequired -State $state.Failure))
+            )
+        }
+
+        if (-not $requiresPhysicalGate) {
+            continue
+        }
+
+        $classification = ""
+        if ($state.PSObject.Properties.Name -contains "Classification") {
+            $classification = [string]$state.Classification
+        }
+        elseif ($state.PSObject.Properties.Name -contains "Failure" -and $state.Failure -and $state.Failure.PSObject.Properties.Name -contains "Classification") {
+            $classification = [string]$state.Failure.Classification
+        }
+
+        $updatedAt = ""
+        if ($state.PSObject.Properties.Name -contains "UpdatedAt") {
+            $updatedAt = [string]$state.UpdatedAt
+        }
+
+        return [pscustomobject]@{
+            Active = $true
+            Source = $candidate.Name
+            Path = $candidate.Path
+            UpdatedAt = $updatedAt
+            Classification = $classification
+        }
+    }
+
+    return [pscustomobject]@{
+        Active = $false
+        Source = ""
+        Path = ""
+        UpdatedAt = ""
+        Classification = ""
+    }
+}
+
 function Test-AppleUsbRepairRebootRequired {
     param([object]$Result)
 
@@ -1633,6 +1786,19 @@ try {
         $brightnessHidReadyBeforeRepair = Invoke-RepairStage -Label "Brightness HID preflight" -ScriptBlock { Test-BrightnessHidReadyQuiet }
         $needsAppleUsbRepair = [bool](-not $hdrPreflightState.HdrActive -or -not $brightnessHidReadyBeforeRepair)
         $hdrStateAfterAppleUsbRepair = $hdrPreflightState
+        $persistedAppleUsbRebootGate = Get-PersistedAppleUsbRebootRequiredGate
+
+        if (
+            $needsAppleUsbRepair -and
+            $persistedAppleUsbRebootGate.Active -and
+            $postRefreshState.Has5K60Enumerated -and
+            $hdrPreflightState.HdrUnsupported -and
+            -not $hdrPreflightState.HdrActive
+        ) {
+            $appleUsbRepairRequiresReboot = $true
+            $needsAppleUsbRepair = $false
+            Write-RepairLog "Existing Apple USB reboot-required HDR gate is active after 5K60 recovery (source=$($persistedAppleUsbRebootGate.Source), updatedAt=$($persistedAppleUsbRebootGate.UpdatedAt), classification=$($persistedAppleUsbRebootGate.Classification)). Skipping Apple USB/HID interface repair for this pass; Windows must complete USB configuration through reboot, resume, or full Thunderbolt/USB physical re-enumeration."
+        }
 
         if ($needsAppleUsbRepair) {
             $appleUsbRepair = Invoke-RepairStage -Label "Apple USB/HID interface repair gate" -ScriptBlock { Invoke-AppleUsbInterfaceRepair }
