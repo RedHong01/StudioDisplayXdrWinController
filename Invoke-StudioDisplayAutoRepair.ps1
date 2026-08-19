@@ -198,6 +198,94 @@ function Save-AutoRepairMaintenanceState {
     }
 }
 
+function Test-AutoRepairRepairLogMarksAppleUsbRebootRequired {
+    param([string]$RepairLogText)
+
+    return [bool](
+        $RepairLogText -match 'APPLE_USB_REBOOT_REQUIRED=True' -or
+        $RepairLogText -match 'System reboot is needed to complete configuration operations' -or
+        $RepairLogText -match 'exitCode=3010'
+    )
+}
+
+function Test-AutoRepairRepairLogFileMarksAppleUsbRebootRequired {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        return Test-AutoRepairRepairLogMarksAppleUsbRebootRequired -RepairLogText $text
+    }
+    catch {
+        Write-AutoRepairLog "Could not inspect repair log for reboot-required evidence: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Test-AutoRepairRepairLogNeedsQuietSettle {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $tail = (Get-Content -LiteralPath $Path -Tail 160 -ErrorAction Stop) -join "`n"
+        return [bool](
+            $tail -match 'Apple USB/HID interface repair exit code: 124 \(timed out\)' -or
+            $tail -match 'TIMING label="Apple USB/HID interface repair".*timedOut=True'
+        )
+    }
+    catch {
+        Write-AutoRepairLog "Could not inspect repair log quiet-settle state: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Wait-AutoRepairRepairLogQuiet {
+    param(
+        [string]$Path,
+        [int]$QuietSeconds = 18,
+        [int]$TimeoutSeconds = 90
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $item) {
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastWriteUtc = $item.LastWriteTimeUtc
+    Write-AutoRepairLog "Repair log contains a timed-out Apple USB stage; waiting up to ${TimeoutSeconds}s for late reboot-required evidence before saving failure state. Log=$Path"
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if (-not $item) {
+            return
+        }
+
+        if ($item.LastWriteTimeUtc -gt $lastWriteUtc) {
+            $lastWriteUtc = $item.LastWriteTimeUtc
+        }
+
+        $quietFor = ([DateTime]::UtcNow - $lastWriteUtc).TotalSeconds
+        if ($quietFor -ge $QuietSeconds) {
+            Write-AutoRepairLog "Repair log stayed quiet for $([int]$quietFor)s after a timed-out Apple USB stage; failure classification can now include any late evidence."
+            return
+        }
+    }
+
+    Write-AutoRepairLog "Repair log did not become quiet within ${TimeoutSeconds}s after a timed-out Apple USB stage; saving best available failure evidence."
+}
+
 function Test-AutoRepairPhysicalReenumerationGateActive {
     param(
         [Parameter(Mandatory = $true)]
@@ -215,6 +303,20 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
             $lastFailure = Get-Content -LiteralPath $lastFailureStateFile -Raw -ErrorAction Stop | ConvertFrom-Json
         }
 
+        $lastFailureLogMarksRebootRequired = [bool](
+            $lastFailure -and
+            ($lastFailure.PSObject.Properties.Name -contains "RepairLog") -and
+            (Test-AutoRepairRepairLogFileMarksAppleUsbRebootRequired -Path ([string]$lastFailure.RepairLog))
+        )
+        if ($lastFailureLogMarksRebootRequired -and -not [bool]$lastFailure.AppleUsbRebootRequired) {
+            $lastFailure | Add-Member -NotePropertyName AppleUsbRebootRequired -NotePropertyValue $true -Force
+            $lastFailure | Add-Member -NotePropertyName NextAction -NotePropertyValue "Windows reported pnputil 3010/reboot-required while rebuilding the Apple USB control interface. Preserve 5K60/brightness, stop HDR identity rollback, and retry only after reboot, resume, or a full Thunderbolt/USB physical re-enumeration." -Force
+            $lastFailure |
+                ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath $lastFailureStateFile -Encoding ascii -ErrorAction SilentlyContinue
+            Write-AutoRepairLog "Upgraded existing Studio Display last failure state to AppleUsbRebootRequired=True from repair-log pnputil 3010 evidence. File=$lastFailureStateFile"
+        }
+
         if (Clear-AutoRepairPhysicalGateIfReenumerated -GateState $gateState -LastFailureState $lastFailure) {
             return $false
         }
@@ -226,6 +328,7 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
                 (
                     [bool]$lastFailure.AppleUsbReferenceModeFailedStart -or
                     [bool]$lastFailure.AppleUsbRebootRequired -or
+                    $lastFailureLogMarksRebootRequired -or
                     $classification -match 'AppleUsbReferenceModeFailedStart|AppleUsbRebootRequired|RebootRequired'
                 )
             )
@@ -239,12 +342,13 @@ function Test-AutoRepairPhysicalReenumerationGateActive {
                 BlockedUntil = (Get-Date).AddHours(12).ToString("o")
                 Count = 1
                 RequiresPhysicalReenumeration = $true
-                AppleUsbRebootRequired = [bool]$lastFailure.AppleUsbRebootRequired
+                AppleUsbRebootRequired = [bool]($lastFailure.AppleUsbRebootRequired -or $lastFailureLogMarksRebootRequired)
                 Reason = "auto repair restored physical gate from last failure"
                 UpdatedAt = (Get-Date).ToString("o")
             }
             $gateState | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $hdrGateBlockStateFile -Encoding ascii -ErrorAction SilentlyContinue
-            Write-AutoRepairLog "Restored HDR physical re-enumeration gate from last failure state before running disruptive repair. classification=$classification"
+            $logEvidenceText = if ($lastFailureLogMarksRebootRequired) { " repairLogContains3010=True" } else { "" }
+            Write-AutoRepairLog "Restored HDR physical re-enumeration gate from last failure state before running disruptive repair. classification=$classification$logEvidenceText"
         }
 
         $updatedAt = [DateTime]::MinValue
@@ -493,11 +597,7 @@ function Save-AutoRepairFailureState {
                 )
             )
         )
-        $appleUsbRebootRequired = [bool](
-            $repairLogText -match 'APPLE_USB_REBOOT_REQUIRED=True' -or
-            $repairLogText -match 'System reboot is needed to complete configuration operations' -or
-            $repairLogText -match 'exitCode=3010'
-        )
+        $appleUsbRebootRequired = Test-AutoRepairRepairLogMarksAppleUsbRebootRequired -RepairLogText $repairLogText
         $classification = if ($modeTableBlocked -and $hdrGateClosed -and $appleUsbReferenceModeFailedStart -and $appleUsbRebootRequired) {
             "ResolutionModeTableAndHdrGateBlockedWithAppleUsbReferenceModeFailedStartAndRebootRequired"
         }
@@ -650,7 +750,12 @@ if ($preRepairState.Ready) {
 }
 
 if (Test-AutoRepairPhysicalReenumerationGateActive -State $preRepairState) {
-    Save-AutoRepairFailureState -State $preRepairState -ExitCode 7 -Reason "$Reason physical-reenumeration-gate"
+    if (Test-Path -LiteralPath $lastFailureStateFile) {
+        Write-AutoRepairLog "Preserved existing Studio Display last failure state while the HDR physical re-enumeration gate is active; not overwriting repair-log evidence with a preflight-only snapshot."
+    }
+    else {
+        Save-AutoRepairFailureState -State $preRepairState -ExitCode 7 -Reason "$Reason physical-reenumeration-gate"
+    }
     Write-AutoRepairLog "Scheduled auto repair skipped disruptive repair because success prerequisites are not present: previous HDR failure requires a fresh Thunderbolt/USB physical re-enumeration. $($preRepairState.Detail)"
     exit 7
 }
@@ -678,12 +783,20 @@ if ($exitCode -eq 0) {
     }
 }
 else {
+    if (Test-AutoRepairRepairLogNeedsQuietSettle -Path $logPath) {
+        Wait-AutoRepairRepairLogQuiet -Path $logPath
+    }
+
     $failureState = Test-AutoRepairCodeZeroState
     Save-AutoRepairFailureState -State $failureState -ExitCode $exitCode -Reason $Reason -RepairLog $logPath
     $failureStateSaved = $true
 }
 
 if ($exitCode -ne 0 -and -not $failureStateSaved) {
+    if (Test-AutoRepairRepairLogNeedsQuietSettle -Path $logPath) {
+        Wait-AutoRepairRepairLogQuiet -Path $logPath
+    }
+
     $failureState = if ($codeZeroState) { $codeZeroState } else { Test-AutoRepairCodeZeroState }
     Save-AutoRepairFailureState -State $failureState -ExitCode $exitCode -Reason $Reason -RepairLog $logPath
 }

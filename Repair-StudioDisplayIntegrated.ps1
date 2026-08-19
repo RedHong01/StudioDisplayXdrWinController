@@ -1260,7 +1260,9 @@ function Invoke-AppleUsbInterfaceRepair {
         $usbArgs += "-Elevate"
     }
 
-    return Invoke-Tool -Label "Apple USB/HID interface repair" -Arguments $usbArgs -TimeoutSeconds 90
+    # Parent Apple USB re-enumeration can report pnputil 3010 after child
+    # interface restarts; avoid racing failure-state classification.
+    return Invoke-Tool -Label "Apple USB/HID interface repair" -Arguments $usbArgs -TimeoutSeconds 210
 }
 
 function Invoke-HdrIdentityRollbackRepair {
@@ -1455,6 +1457,45 @@ function Test-StateMarksAppleUsbRebootRequired {
     return $false
 }
 
+function Get-RepairStateRepairLogPath {
+    param([object]$State)
+
+    if (-not $State) {
+        return ""
+    }
+
+    if ($State.PSObject.Properties.Name -contains "RepairLog" -and -not [string]::IsNullOrWhiteSpace([string]$State.RepairLog)) {
+        return [string]$State.RepairLog
+    }
+
+    if ($State.PSObject.Properties.Name -contains "Failure" -and $State.Failure) {
+        return Get-RepairStateRepairLogPath -State $State.Failure
+    }
+
+    return ""
+}
+
+function Test-RepairLogMarksAppleUsbRebootRequired {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        return [bool](
+            $text -match 'APPLE_USB_REBOOT_REQUIRED=True' -or
+            $text -match 'System reboot is needed to complete configuration operations' -or
+            $text -match 'exitCode=3010'
+        )
+    }
+    catch {
+        Write-RepairLog "Could not inspect repair log for Apple USB reboot-required evidence: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Get-RepairStateUpdatedAt {
     param([object]$State)
 
@@ -1531,7 +1572,16 @@ function Get-PersistedAppleUsbRebootRequiredGate {
                 continue
             }
         }
-        if (-not (Test-StateMarksAppleUsbRebootRequired -State $state)) {
+        $stateMarksRebootRequired = Test-StateMarksAppleUsbRebootRequired -State $state
+        if (-not $stateMarksRebootRequired) {
+            $repairLogPath = Get-RepairStateRepairLogPath -State $state
+            $stateMarksRebootRequired = Test-RepairLogMarksAppleUsbRebootRequired -Path $repairLogPath
+            if ($stateMarksRebootRequired) {
+                Write-RepairLog "Persisted $($candidate.Name) did not mark AppleUsbRebootRequired=True, but its repair log contains pnputil 3010/reboot-required evidence. Treating the gate as reboot-required for this pass."
+            }
+        }
+
+        if (-not $stateMarksRebootRequired) {
             continue
         }
 

@@ -150,6 +150,26 @@ function Read-JsonFile {
     }
 }
 
+function Test-RepairLogMarksAppleUsbRebootRequired {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        return [bool](
+            $text -match 'APPLE_USB_REBOOT_REQUIRED=True' -or
+            $text -match 'System reboot is needed to complete configuration operations' -or
+            $text -match 'exitCode=3010'
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-LatestObserverSnapshot {
     try {
         $latest = Get-ChildItem -LiteralPath $reportsRoot -Filter "StudioDisplayPassiveHotplugObserver-*.jsonl" -ErrorAction Stop |
@@ -222,6 +242,11 @@ $results.Add((Test-FileContains -Path $manager -Pattern 'Save-StudioDisplayPhysi
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'StudioDisplayPhysicalReenumerationState\.json' -Name "guard:auto-repair-reads-physical-reenumeration-marker" -Detail "scheduled repair can clear stale gates after a newer physical re-enumeration marker")) | Out-Null
 $results.Add((Test-FileContains -Path $autoRepair -Pattern 'marker is newer than the persisted gate/failure' -Name "guard:auto-repair-clears-stale-physical-gate" -Detail "auto repair refuses to reuse stale Apple USB reboot-required gates after real hot-plug")) | Out-Null
 $results.Add((Test-FileContains -Path $integratedRepair -Pattern 'Ignoring persisted .*physical re-enumeration marker is newer' -Name "guard:integrated-repair-ignores-stale-persisted-gate" -Detail "integrated repair allows one fresh pass after true physical re-enumeration")) | Out-Null
+$results.Add((Test-FileContains -Path $integratedRepair -Pattern 'Apple USB/HID interface repair.*TimeoutSeconds 210' -Name "guard:apple-usb-repair-timeout-covers-parent-3010" -Detail "integrated repair waits long enough for Apple USB parent 3010/reboot-required evidence")) | Out-Null
+$results.Add((Test-FileContains -Path $integratedRepair -Pattern 'repair log contains pnputil 3010/reboot-required evidence' -Name "guard:integrated-repair-backfills-log-3010-gate" -Detail "persisted gates can be upgraded from repair-log 3010 evidence")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'Wait-AutoRepairRepairLogQuiet' -Name "guard:auto-repair-waits-for-late-usb-evidence" -Detail "failure state is saved only after timed-out Apple USB logs settle")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'Preserved existing Studio Display last failure state' -Name "guard:auto-repair-preserves-last-failure-evidence" -Detail "physical-gate skips do not overwrite repair-log evidence with a preflight-only snapshot")) | Out-Null
+$results.Add((Test-FileContains -Path $autoRepair -Pattern 'Upgraded existing Studio Display last failure state to AppleUsbRebootRequired=True' -Name "guard:auto-repair-upgrades-last-failure-from-log-3010" -Detail "legacy false reboot-required state can be corrected from repair-log 3010 evidence")) | Out-Null
 
 $maintenanceStatePath = Join-Path $InstallRoot "StudioDisplayAutomationMaintenanceState.json"
 $maintenanceState = Read-JsonFile -Path $maintenanceStatePath
@@ -231,6 +256,15 @@ $bridgePid = Get-ManagedPidState -FileName "BrightnessKeyBridge.pid"
 $observerSnapshot = Get-LatestObserverSnapshot
 
 if ($maintenanceState) {
+    $failureRepairLog = if ($maintenanceState.Failure -and $maintenanceState.Failure.PSObject.Properties.Name -contains "RepairLog") {
+        [string]$maintenanceState.Failure.RepairLog
+    } else {
+        ""
+    }
+    $failureRebootRequired = [bool](
+        $maintenanceState.Failure.AppleUsbRebootRequired -or
+        (Test-RepairLogMarksAppleUsbRebootRequired -Path $failureRepairLog)
+    )
     $gateIsSafe = [bool](
         $maintenanceState.Stage -eq "HdrGateWaitingForPhysicalReenumeration" -and
         $maintenanceState.RequiresPhysicalReenumeration -and
@@ -238,7 +272,7 @@ if ($maintenanceState) {
         $maintenanceState.Resolution.FiveK60Enumerated -and
         $maintenanceState.Hdr.HdrUnsupported -and
         -not $maintenanceState.Hdr.HdrActive -and
-        $maintenanceState.Failure.AppleUsbRebootRequired
+        $failureRebootRequired
     )
     $results.Add((New-GuardResult -Name "runtime:physical-gate-preserves-5k60" -Passed $gateIsSafe -Detail "maintenance state is waiting for physical re-enumeration while preserving 5K60" -Data $maintenanceState)) | Out-Null
 }

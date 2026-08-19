@@ -22,6 +22,13 @@
   records true disconnect/reconnect/resume evidence, and offline auto-repair
   workers use that newer marker to clear stale HDR physical gates before running
   one fresh conservative pass.
+- Extended the Apple USB/HID repair wait and added repair-log quiet settling
+  before failure-state classification. This prevents a timed-out USB helper from
+  saving `AppleUsbRebootRequired=false` moments before late `pnputil 3010`
+  evidence arrives.
+- Preserved existing last-failure evidence while the HDR physical re-enumeration
+  gate is active, so a preflight-only skip cannot erase the repair log that
+  explains why the controller is waiting.
 - Installed `HdrScreenshotGuard.ps1` and the offline maintenance guard through
   the release installer so fresh GitHub clones match the local running
   controller component set.

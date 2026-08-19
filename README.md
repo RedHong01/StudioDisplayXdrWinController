@@ -106,13 +106,17 @@ powershell -ExecutionPolicy Bypass -File .\Install-StudioDisplayTools.ps1 `
   applies the safe SDR white-level guardrails used by the tray.
 - `Repair-StudioDisplayIntegrated.ps1`
   Orchestrates the current safe repair order: 5K mode-table validation, USB4
-  retrain when needed, HDR attempt, and brightness HID validation.
+  retrain when needed, Apple USB/HID repair with enough settle time to capture
+  upstream `pnputil 3010` results, HDR attempt, and brightness HID validation.
 - `Invoke-StudioDisplayAutoRepair.ps1 -ValidateOnly`
   Non-disruptive final-state validator used by automation. It returns success
   only when 5K60 is current/enumerated, HDR is supported and active, and
   Studio Display HID brightness is readable. When that final gate passes, it
   also records `StudioDisplayKnownGoodState.json` in the installed controller
-  folder so later hot-plug debugging has a single known-good baseline.
+  folder so later hot-plug debugging has a single known-good baseline. When an
+  Apple USB repair stage times out, the launcher waits for the repair log to
+  become quiet before saving failure state so late `pnputil 3010` evidence is
+  not lost.
 - `Test-StudioDisplayHotplugAutomation.ps1`
   Read-only audit for the hot-plug automation chain. It checks that the tray,
   brightness workers, elevated scheduled task, Boot Camp-style success recipe,
